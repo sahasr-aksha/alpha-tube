@@ -6,7 +6,7 @@
 -->
 
 <p align="center">
-  <img src="./readme-banner.png" alt="Alpha Tube - Kawaii Video Downloader" width="100%">
+  <img src="./readme-banner.jpg" alt="Alpha Tube - Kawaii Video Downloader" width="100%">
 </p>
 
 <h1 align="center">🎬 Alpha Tube</h1>
