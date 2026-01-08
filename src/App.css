@@ -1,0 +1,55 @@
+/* App.css - Cleaned up for new theme */
+.logo {
+  height: 6em;
+  padding: 1.5em;
+  will-change: filter;
+  transition: filter 300ms;
+}
+
+.logo:hover {
+  filter: drop-shadow(0 0 2em #646cffaa);
+}
+
+.logo.react:hover {
+  filter: drop-shadow(0 0 2em #61dafbaa);
+}
+
+@keyframes logo-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes bounce-gentle {
+
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+
+  50% {
+    transform: translateY(-5px);
+  }
+}
+
+@keyframes pulse-glow {
+
+  0%,
+  100% {
+    opacity: 1;
+    filter: drop-shadow(0 0 5px rgba(0, 255, 163, 0.5));
+  }
+
+  50% {
+    opacity: 0.7;
+    filter: drop-shadow(0 0 2px rgba(0, 255, 163, 0.2));
+  }
+}
+
+.kawaii-text-change {
+  animation: bounce-gentle 0.5s ease-in-out;
+}
