@@ -82,7 +82,7 @@ When you first install Alpha Tube, Windows may show a SmartScreen warning saying
 
 ### Why does this happen?
 
-Microsoft requires developers to purchase an **Extended Validation (EV) Code Signing Certificate** (which costs $300-500/year) to bypass SmartScreen instantly. As an indie developer offering this app **completely free**, I can't afford this certificate. The app is **100% safe and open-source** — you can inspect the code yourself!
+Microsoft requires developers to purchase an **Extended Validation (EV) Code Signing Certificate** (which costs $300-500/year) to bypass SmartScreen instantly. As an indie developer offering this app **completely free**, I can't afford this certificate. The app is **100% safe and open-source**, you can inspect the code yourself!
 
 ### How to install anyway:
 
