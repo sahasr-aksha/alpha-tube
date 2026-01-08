@@ -78,7 +78,7 @@
 
 ## ⚠️ Windows SmartScreen Warning
 
-When you first install Alpha Tube, Windows may show a SmartScreen warning saying the app is "unrecognized" or "could harm your PC." **Don't worry — this is normal!**
+When you first install Alpha Tube, Windows may show a SmartScreen warning saying the app is "unrecognized" or "could harm your PC." **Don't worry, this is normal!**
 
 ### Why does this happen?
 
