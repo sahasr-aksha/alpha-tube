@@ -1456,6 +1456,87 @@ async fn check_and_download_update(app: AppHandle) {
     }
 }
 
+/// Check for and apply yt-dlp updates silently
+/// Only runs when no downloads are in progress
+/// Emits events for future frontend notification:
+/// - "ytdlp-update-status" with { status: "checking" | "updating" | "complete" | "error" | "skipped", message?: string }
+fn check_and_update_ytdlp(app: &AppHandle) {
+    println!("[yt-dlp Updater] Checking for updates...");
+    
+    // Check if any downloads are active
+    let download_manager: tauri::State<'_, DownloadManager> = app.state();
+    {
+        let manager = download_manager.lock().unwrap();
+        if !manager.is_empty() {
+            println!("[yt-dlp Updater] Downloads in progress, skipping update check");
+            let _ = app.emit("ytdlp-update-status", serde_json::json!({
+                "status": "skipped",
+                "message": "Downloads in progress"
+            }));
+            return;
+        }
+    }
+    
+    // Get yt-dlp path
+    let yt_dlp_path = match get_sidecar_path(app, "yt-dlp") {
+        Ok(path) => path,
+        Err(e) => {
+            println!("[yt-dlp Updater] Failed to get yt-dlp path: {}", e);
+            let _ = app.emit("ytdlp-update-status", serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to get yt-dlp path: {}", e)
+            }));
+            return;
+        }
+    };
+    
+    // Emit checking status
+    let _ = app.emit("ytdlp-update-status", serde_json::json!({
+        "status": "checking"
+    }));
+    
+    // Run yt-dlp -U silently
+    let mut cmd = Command::new(&yt_dlp_path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    
+    cmd.arg("-U");
+    
+    match cmd.output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            
+            if output.status.success() {
+                // Check if actually updated or already up-to-date
+                let message = stdout.trim().to_string();
+                let is_updated = message.contains("Updated") || message.contains("Updating");
+                
+                println!("[yt-dlp Updater] {}", message);
+                let _ = app.emit("ytdlp-update-status", serde_json::json!({
+                    "status": "complete",
+                    "message": message,
+                    "updated": is_updated
+                }));
+            } else {
+                let error_msg = stderr.trim().to_string();
+                println!("[yt-dlp Updater] Update failed: {}", error_msg);
+                let _ = app.emit("ytdlp-update-status", serde_json::json!({
+                    "status": "error",
+                    "message": error_msg
+                }));
+            }
+        }
+        Err(e) => {
+            println!("[yt-dlp Updater] Failed to run update: {}", e);
+            let _ = app.emit("ytdlp-update-status", serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to run update: {}", e)
+            }));
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 
 pub fn run() {
@@ -1490,6 +1571,20 @@ pub fn run() {
                 loop {
                     tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
                     check_and_download_update(app_handle.clone()).await;
+                }
+            });
+
+            // Start background yt-dlp update checker
+            let app_handle_ytdlp = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Wait 30 seconds after startup to allow app to stabilize
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                check_and_update_ytdlp(&app_handle_ytdlp);
+                
+                // Then check every 12 hours
+                loop {
+                    tokio::time::sleep(Duration::from_secs(12 * 60 * 60)).await;
+                    check_and_update_ytdlp(&app_handle_ytdlp);
                 }
             });
 

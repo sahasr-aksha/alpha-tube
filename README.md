@@ -6,7 +6,7 @@
 -->
 
 <p align="center">
-  <img src="./readme-banner.png" alt="Alpha Tube - Free Video Downloader for Windows" width="100%">
+  <img src="./readme-banner.png" alt="Alpha Tube - Kawaii Video Downloader" width="100%">
 </p>
 
 <h1 align="center">🎬 Alpha Tube</h1>
@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/sahasr-aksha/alpha-tube/releases"><img src="https://img.shields.io/badge/Download-Windows%20Installer-2ea44f?style=for-the-badge&logo=windows" alt="Download"></a>
+  <a href="https://github.com/sahasr-aksha/alpha-tube/releases"><img src="https://img.shields.io/badge/Download-Windows%20Installer-pink?style=for-the-badge&logo=windows" alt="Download"></a>
 </p>
 
 <p align="center">
@@ -40,30 +40,49 @@
 
 | Feature | Description |
 |---------|-------------|
-| ⚡ **Blazing Fast** | Native Windows performance with Rust backend - no Electron bloat |
-| 🎥 **Multi-Platform Support** | Download from YouTube, Vimeo, Twitter, Instagram, TikTok & 1000+ sites |
-| 📺 **HD Quality Options** | Choose your preferred resolution: 4K, 1080p, 720p, or audio-only |
-| 🎵 **MP3 Extraction** | Extract audio from any video in high quality MP3 format |
-| �️ **Built-in Player** | Watch downloaded videos without leaving the app |
+| ⚡ **Super Fast** | Native Windows performance with Rust backend (Zoom zoom!) |
+| 🌸 **Kawaii UI** | Modern glassmorphism design that's pleasing to the eyes |
+| 🎥 **Universal** | Works with YouTube, TikTok, Instagram & 1000+ sites |
+| � **HD Quality** | Crystal clear 4K, 1080p downloads |
+| 🎵 **MP3 Support** | Extract music in high quality audio format |
+| 🍿 **Built-in Player** | Watch your videos directly in the app |
 | 🌙 **Modern Dark UI** | Sleek glassmorphism design that's easy on the eyes |
-| 🔒 **Privacy First** | 100% offline processing - your data never leaves your PC |
-| 📦 **Portable** | Lightweight ~50MB installer, minimal system requirements |
+| 🔒 **Privacy First** | 100% offline processing - your data stays yours |
+| 🎒 **Portable** | Lightweight & cute ~50MB installer |
 
 ---
 
 ## 📸 Screenshots
 
+## 📸 Screenshots
+
 <p align="center">
-  <img src="./social-preview.png" alt="Alpha Tube Screenshot" width="80%">
+  <img src="screenshots/Screenshot%202026-01-08%20114747.jpg" width="45%" alt="Screenshot 1">
+  <img src="screenshots/Screenshot%202026-01-08%20114807.jpg" width="45%" alt="Screenshot 2">
+</p>
+<p align="center">
+  <img src="screenshots/Screenshot%202026-01-08%20115529.jpg" width="45%" alt="Screenshot 3">
+  <img src="screenshots/Screenshot%202026-01-08%20115554.png" width="45%" alt="Screenshot 4">
+</p>
+<p align="center">
+  <img src="screenshots/Screenshot%202026-01-08%20115611.jpg" width="45%" alt="Screenshot 5">
+  <img src="screenshots/Screenshot%202026-01-08%20115658.jpg" width="45%" alt="Screenshot 6">
+</p>
+<p align="center">
+  <img src="screenshots/Screenshot%202026-01-08%20115708.jpg" width="45%" alt="Screenshot 7">
+  <img src="screenshots/Screenshot%202026-01-08%20115727.jpg" width="45%" alt="Screenshot 8">
+</p>
+<p align="center">
+  <img src="screenshots/Screenshot%202026-01-08%20120535.jpg" width="45%" alt="Screenshot 9">
 </p>
 
 ---
 
-## � Installation
+## 🌸 Installation
 
 ### Option 1: Download Installer (Recommended)
 
-1. Download the latest [Windows Installer (.msi)](https://github.com/sahasr-aksha/alpha-tube/releases/latest)
+1. Download the latest [Windows Installer (.exe)](https://github.com/sahasr-aksha/alpha-tube/releases/latest)
 2. Run the installer and follow the setup wizard
 3. Launch Alpha Tube from the Start Menu
 
@@ -132,6 +151,14 @@ Alpha Tube is open-source, so you can inspect the code yourself. It processes ev
 
 Alpha Tube requires Windows 10 or Windows 11 with WebView2 runtime.
 </details>
+
+---
+
+## 🚧 Known Issues
+
+| Issue | Status |
+|-------|--------|
+| 🎧 **Dual Audio Tracks** | The built-in player currently cannot handle videos with dual audio tracks. **Fix in progress!** |
 
 ---
 
