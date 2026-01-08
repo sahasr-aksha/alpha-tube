@@ -76,6 +76,24 @@
 
 ---
 
+## ⚠️ Windows SmartScreen Warning
+
+When you first install Alpha Tube, Windows may show a SmartScreen warning saying the app is "unrecognized" or "could harm your PC." **Don't worry — this is normal!**
+
+### Why does this happen?
+
+Microsoft requires developers to purchase an **Extended Validation (EV) Code Signing Certificate** (which costs $300-500/year) to bypass SmartScreen instantly. As an indie developer offering this app **completely free**, I can't afford this certificate. The app is **100% safe and open-source** — you can inspect the code yourself!
+
+### How to install anyway:
+
+1. Click **"More info"** on the SmartScreen popup
+2. Click **"Run anyway"**
+3. Continue with the installation ✨
+
+> 💡 **Tip:** As more users install Alpha Tube, Windows will automatically build trust and the warning will eventually disappear!
+
+---
+
 ## 🌸 Installation
 
 ### Option 1: Download Installer (Recommended)
