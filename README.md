@@ -48,7 +48,7 @@
 | 🍿 **Built-in Player** | Watch your videos directly in the app |
 | 🌙 **Modern Dark UI** | Sleek glassmorphism design that's easy on the eyes |
 | 🔒 **Privacy First** | 100% offline processing - your data stays yours |
-| 🎒 **Portable** | Lightweight & cute ~50MB installer |
+| 🎒 **Portable** | Lightweight & fast ~23MB installer |
 
 ---
 
