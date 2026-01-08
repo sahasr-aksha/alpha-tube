@@ -34,3 +34,7 @@ src-tauri/binaries/
 
 # Backup files
 *.bak
+
+# Security
+*.key
+*.p12

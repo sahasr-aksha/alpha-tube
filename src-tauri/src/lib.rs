@@ -84,6 +84,16 @@ pub struct DownloadState {
 
 pub type DownloadManager = Mutex<HashMap<String, DownloadState>>;
 
+// Playback state for HLS streaming processes
+#[derive(Clone, Serialize)]
+pub struct PlaybackState {
+    pub child_pid: u32,
+    pub video_path: String,
+    pub stream_hash: String,
+}
+
+pub type PlaybackManager = Mutex<HashMap<String, PlaybackState>>;
+
 // New Commands for File Management
 
 #[tauri::command]
@@ -238,6 +248,7 @@ pub struct VideoMetadata {
     pub height: u32,
     pub codec: String,
     pub file_size: u64,
+    pub audio_tracks: Vec<String>,
 }
 
 #[tauri::command]
@@ -1132,9 +1143,9 @@ async fn scan_library(directory: String) -> Result<LibraryContent, String> {
 
 /// Get video metadata using ffprobe (LOCAL FILES)
 #[tauri::command]
-async fn get_local_video_metadata(app: AppHandle, video_path: String) -> Result<VideoMetadata, String> {
+async fn get_local_video_metadata(app: AppHandle, path: String) -> Result<VideoMetadata, String> {
     let ffprobe_path = get_sidecar_path(&app, "ffprobe")?;
-    
+
     let mut cmd = Command::new(&ffprobe_path);
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000);
@@ -1143,42 +1154,47 @@ async fn get_local_video_metadata(app: AppHandle, video_path: String) -> Result<
             "-v", "quiet",
             "-print_format", "json",
             "-show_format",
-            "-show_streams",
-            &video_path,
+            "-show_streams", // Added streams
+            &path,
         ])
         .output()
         .map_err(|e| format!("Failed to run ffprobe: {}", e))?;
-    
+
     if !output.status.success() {
-        return Err("ffprobe failed to analyze video".to_string());
+        return Err("ffprobe failed".to_string());
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Failed to parse ffprobe output: {}", e))?;
+
+    let format = &json["format"];
+    let duration = format["duration"].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    
+    // Find first video stream for resolution
+    let streams = json["streams"].as_array().ok_or("No streams found")?;
+    let video_stream = streams.iter().find(|s| s["codec_type"] == "video");
+    
+    let width = video_stream.and_then(|s| s["width"].as_u64()).unwrap_or(0) as u32;
+    let height = video_stream.and_then(|s| s["height"].as_u64()).unwrap_or(0) as u32;
+    let codec = video_stream.and_then(|s| s["codec_name"].as_str()).unwrap_or("unknown").to_string();
+
+    // Extract audio tracks
+    let mut audio_tracks = Vec::new();
+    for stream in streams.iter().filter(|s| s["codec_type"] == "audio") {
+        let lang = stream["tags"]["language"].as_str().unwrap_or("unknown");
+        let title = stream["tags"]["title"].as_str().unwrap_or(lang);
+        let codec = stream["codec_name"].as_str().unwrap_or("");
+        
+        let label = if title != "unknown" { 
+            title.to_string() 
+        } else { 
+            format!("{} ({})", lang, codec)
+        };
+        
+        audio_tracks.push(label);
     }
     
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value = serde_json::from_str(&json_str)
-        .map_err(|e| format!("Failed to parse ffprobe output: {}", e))?;
-    
-    // Find video stream
-    let streams = json["streams"].as_array()
-        .ok_or("No streams found in video")?;
-    
-    let video_stream = streams.iter()
-        .find(|s| s["codec_type"].as_str() == Some("video"))
-        .ok_or("No video stream found")?;
-    
-    // Extract metadata
-    let duration = json["format"]["duration"]
-        .as_str()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    
-    let width = video_stream["width"].as_u64().unwrap_or(0) as u32;
-    let height = video_stream["height"].as_u64().unwrap_or(0) as u32;
-    let codec = video_stream["codec_name"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
-    
-    let file_size = json["format"]["size"]
+    let file_size = format["size"]
         .as_str()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
@@ -1189,12 +1205,18 @@ async fn get_local_video_metadata(app: AppHandle, video_path: String) -> Result<
         height,
         codec,
         file_size,
+        audio_tracks,
     })
 }
 
 /// Prepare HLS stream for local video if it has multiple audio tracks
+/// Now spawns ffmpeg asynchronously and returns early once manifest is ready
 #[tauri::command]
-async fn prepare_hls_stream(app: AppHandle, video_path: String) -> Result<String, String> {
+async fn prepare_hls_stream(
+    app: AppHandle, 
+    video_path: String,
+    playback_state: State<'_, PlaybackManager>,
+) -> Result<String, String> {
     // 1. Check for audio streams using ffprobe
     let ffprobe_path = get_sidecar_path(&app, "ffprobe")?;
     
@@ -1223,8 +1245,6 @@ async fn prepare_hls_stream(app: AppHandle, video_path: String) -> Result<String
 
     // If 1 or fewer audio streams, no need for HLS. Return original path.
     if audio_count <= 1 {
-        // App expects asset url if not HLS? Or just path?
-        // CyberPlayer uses convertFileSrc(videoPath). If we return path here, it works.
         println!("Video has {} audio streams. Using direct file playback.", audio_count);
         return Ok(video_path);
     }
@@ -1244,36 +1264,51 @@ async fn prepare_hls_stream(app: AppHandle, video_path: String) -> Result<String
     let mut hasher = DefaultHasher::new();
     video_path.hash(&mut hasher);
     let hash = hasher.finish();
-    let stream_dir = data_dir.join(format!("{:x}", hash));
+    let stream_hash = format!("{:x}", hash);
+    let stream_dir = data_dir.join(&stream_hash);
 
     if !stream_dir.exists() {
         fs::create_dir_all(&stream_dir).map_err(|e| format!("Failed to create stream dir: {}", e))?;
     }
 
     let master_playlist_path = stream_dir.join("master.m3u8");
+    let init_file_path = stream_dir.join("init.mp4");
 
-    // 3. Check if HLS exists
-    if master_playlist_path.exists() {
-        println!("HLS cache found at {:?}", master_playlist_path);
+    let marker_path = stream_dir.join("stream.done");
+
+    // 3. Check if HLS already exists AND is complete (cached)
+    if master_playlist_path.exists() && init_file_path.exists() && marker_path.exists() {
+        println!("HLS cache found and complete at {:?}", master_playlist_path);
         return Ok(master_playlist_path.to_string_lossy().to_string());
     }
 
-    // 4. Transmux to HLS using ffmpeg
-    // ffmpeg -i input.mp4 -map 0:v -map 0:a? -c:v copy -c:a copy -f hls 
-    // -hls_time 10 -hls_list_size 0 -hls_segment_filename "seg_%03d.ts" master.m3u8
-    
+    // If cache exists but no marker, it's incomplete/corrupt -> delete it
+    if stream_dir.exists() {
+        println!("Found incomplete HLS cache, cleaning up...");
+        let _ = fs::remove_dir_all(&stream_dir);
+        let _ = fs::create_dir_all(&stream_dir);
+    }
+
+    // 4. Check if transcoding is already in progress for this video
+    {
+        let manager = playback_state.lock().unwrap();
+        if manager.contains_key(&stream_hash) {
+            println!("HLS generation already in progress for this video, waiting...");
+            // Fall through to the polling loop below
+        }
+    }
+
+    // 5. Spawn ffmpeg asynchronously
     let ffmpeg_path = get_sidecar_path(&app, "ffmpeg")?;
     
-    // We use AC3/AAC copy? Vidstack likely needs AAC for best compatibility in HLS.
-    // If codecs are weird, we might need to convert. But usually copy is fine for MP4 sources.
-    // Let's stick to copy for speed.
-    
-    println!("Starting ffmpeg transmux...");
+    println!("Starting ffmpeg transmux (async)...");
     let mut ffmpeg_cmd = Command::new(&ffmpeg_path);
     #[cfg(target_os = "windows")]
     ffmpeg_cmd.creation_flags(0x08000000);
 
-    let status = ffmpeg_cmd.arg("-i")
+    let mut child = ffmpeg_cmd
+        .current_dir(&stream_dir) // Run inside stream folder so relative paths work in manifest
+        .arg("-i")
         .arg(&video_path)
         .arg("-map")
         .arg("0:v") // Map all video streams (usually 1)
@@ -1286,24 +1321,159 @@ async fn prepare_hls_stream(app: AppHandle, video_path: String) -> Result<String
         .arg("-f")
         .arg("hls")
         .arg("-hls_time")
-        .arg("4") // Reduced to 4s for better seeking/startup
+        .arg("4") // 4s segments for faster startup
         .arg("-hls_list_size")
         .arg("0")
+        .arg("-hls_playlist_type")
+        .arg("event") // Tell player this is a growing stream
         .arg("-hls_segment_type")
-        .arg("fmp4") // Use Fragmented MP4 (better for copy mode)
+        .arg("fmp4")
         .arg("-hls_fmp4_init_filename")
-        .arg(stream_dir.join("init.mp4")) // Fix: specify init file path explicitly
+        .arg("init.mp4") // Relative path
         .arg("-hls_segment_filename")
-        .arg(stream_dir.join("seg_%03d.m4s"))
-        .arg(&master_playlist_path)
-        .status()
-        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+        .arg("seg_%03d.m4s") // Relative path
+        .arg("master.m3u8") // Relative output path
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
 
-    if status.success() {
-        println!("HLS generation complete.");
-        Ok(master_playlist_path.to_string_lossy().to_string())
+    let child_pid = child.id();
+    let stream_hash_clone = stream_hash.clone();
+    let app_handle = app.clone();
+    let marker_path_clone = marker_path.clone();
+
+    // Spawn a background thread to wait for the process and handle cleanup/marking
+    std::thread::spawn(move || {
+        let status = child.wait();
+        
+        // Remove from manager when done
+        let manager_state: State<PlaybackManager> = app_handle.state();
+        {
+             let mut manager = manager_state.lock().unwrap();
+             manager.remove(&stream_hash_clone);
+        }
+
+        match status {
+            Ok(s) => {
+                if s.success() {
+                    println!("FFmpeg finished successfully. Marking stream as done.");
+                    let _ = fs::File::create(marker_path_clone);
+                } else {
+                    println!("FFmpeg finished with error.");
+                }
+            }
+            Err(e) => println!("Failed to wait on ffmpeg child: {}", e),
+        }
+    });
+
+    // 6. Register in playback manager (for cancellation)
+    {
+        let mut manager = playback_state.lock().unwrap();
+        manager.insert(stream_hash.clone(), PlaybackState {
+            child_pid,
+            video_path: video_path.clone(),
+            stream_hash: stream_hash.clone(),
+        });
+    }
+
+    // 7. Poll for manifest + init file to be ready (timeout 30s)
+    let poll_interval = Duration::from_millis(200);
+    let max_wait = Duration::from_secs(30);
+    let start_time = std::time::Instant::now();
+
+    loop {
+        // Check if both manifest and init file exist
+        if master_playlist_path.exists() && init_file_path.exists() {
+            // Also check if there's at least one segment
+            let first_segment = stream_dir.join("seg_000.m4s");
+            if first_segment.exists() {
+                println!("HLS stream ready for playback (ffmpeg continues in background)");
+                return Ok(master_playlist_path.to_string_lossy().to_string());
+            }
+        }
+
+        if start_time.elapsed() > max_wait {
+            // Timeout - cleanup and return error
+            {
+                let mut manager = playback_state.lock().unwrap();
+                if let Some(state) = manager.remove(&stream_hash) {
+                    // Kill the process
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _ = Command::new("taskkill")
+                            .creation_flags(0x08000000)
+                            .args(["/F", "/T", "/PID", &state.child_pid.to_string()])
+                            .output();
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        let _ = Command::new("kill")
+                            .arg(state.child_pid.to_string())
+                            .output();
+                    }
+                }
+            }
+            return Err("Timeout waiting for HLS stream to be ready".to_string());
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+
+
+/// Cancel/stop HLS streaming process for a video (or specific audio track)
+#[tauri::command]
+async fn cancel_stream(
+    video_path: String,
+    audio_index: Option<usize>,
+    playback_state: State<'_, PlaybackManager>,
+) -> Result<String, String> {
+    // Hash to find the stream
+    let mut hasher = DefaultHasher::new();
+    video_path.hash(&mut hasher);
+    if let Some(idx) = audio_index {
+        idx.hash(&mut hasher);
+    }
+    let hash = hasher.finish();
+    let stream_hash = format!("{:x}", hash);
+
+    let mut manager = playback_state.lock().unwrap();
+    
+    if let Some(state) = manager.remove(&stream_hash) {
+        println!("Stopping HLS generation for: {}", video_path);
+        
+        // Kill the ffmpeg process
+        #[cfg(target_os = "windows")]
+        {
+            let output = Command::new("taskkill")
+                .creation_flags(0x08000000)
+                .args(["/F", "/T", "/PID", &state.child_pid.to_string()])
+                .output();
+            
+            match output {
+                Ok(o) => {
+                    if o.status.success() {
+                        println!("Successfully killed ffmpeg process {}", state.child_pid);
+                    } else {
+                        println!("Process {} may have already exited", state.child_pid);
+                    }
+                }
+                Err(e) => println!("Failed to kill process: {}", e),
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = Command::new("kill")
+                .arg(state.child_pid.to_string())
+                .output();
+        }
+        
+        Ok("Stream cancelled".to_string())
     } else {
-        Err("ffmpeg failed to generate HLS".to_string())
+        // Process might have finished naturally, that's fine
+        Ok("No active stream for this video".to_string())
     }
 }
 
@@ -1551,6 +1721,8 @@ pub fn run() {
         .setup(|app| {
             // Initialize Download Manager State
             app.manage(std::sync::Mutex::new(std::collections::HashMap::<String, DownloadState>::new()));
+            // Initialize Playback Manager State (for HLS ffmpeg processes)
+            app.manage(std::sync::Mutex::new(std::collections::HashMap::<String, PlaybackState>::new()));
 
             #[cfg(target_os = "windows")]
             {
@@ -1605,6 +1777,7 @@ pub fn run() {
             get_video_metadata,
             open_youtube_window,
             prepare_hls_stream,
+            cancel_stream,
             get_app_config, 
             set_download_dir, 
             cancel_download, 
