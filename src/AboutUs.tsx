@@ -57,7 +57,7 @@ function AboutUs() {
                     {/* Left: Window Title equivalent */}
                     <div className="text-xs tracking-widest uppercase text-cyan-400 font-bold flex items-center gap-2">
                         <Terminal size={12} />
-                        <span>Alpha Tube v0.1.2</span>
+                        <span>Alpha Tube v0.1.3</span>
                     </div>
 
                     {/* Right: Modules (Only Battery & Time) */}

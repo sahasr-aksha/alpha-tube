@@ -274,9 +274,16 @@ fn get_sidecar_path(app: &AppHandle, name: &str) -> Result<std::path::PathBuf, S
         search_paths.push(resource_path.join("bin"));
     }
     
-    // 2. Try relative to exe (works in dev mode - target/debug/)
+    // 2. Try relative to exe (works in both dev and release mode)
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
+            // PRIORITY: Try the executable directory directly (release/installed builds)
+            // In installed apps, binaries are placed alongside the main exe
+            search_paths.push(exe_dir.to_path_buf());
+            
+            // Also try bin subfolder alongside exe
+            search_paths.push(exe_dir.join("bin"));
+            
             // In dev mode, exe is in target/debug/, but bins are in src-tauri/bin/
             // Go up to src-tauri/bin
             let dev_bin_path = exe_dir.parent()  // target/
@@ -285,9 +292,6 @@ fn get_sidecar_path(app: &AppHandle, name: &str) -> Result<std::path::PathBuf, S
             if let Some(path) = dev_bin_path {
                 search_paths.push(path);
             }
-            
-            // Also try alongside the exe
-            search_paths.push(exe_dir.join("bin"));
         }
     }
     
@@ -560,7 +564,47 @@ async fn download_video_internal(
     is_resume: bool,
 ) -> Result<String, String> {
     let yt_dlp_path = get_sidecar_path(&app, "yt-dlp")?;
-    let ffmpeg_path = get_sidecar_path(&app, "ffmpeg")?;
+    
+    // Get ffmpeg location - try multiple approaches for maximum compatibility
+    // yt-dlp's --ffmpeg-location can accept either a directory or full binary path
+    let ffmpeg_location = {
+        // Approach 1: Use executable directory directly (post-installation, binaries alongside exe)
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                // Check if ffmpeg exists in the exe directory
+                let possible_names = [
+                    "ffmpeg.exe",
+                    "ffmpeg-x86_64-pc-windows-msvc.exe",
+                    "ffmpeg-x86_64-pc-windows-gnu.exe",
+                ];
+                let found_in_exe_dir = possible_names.iter().any(|name| exe_dir.join(name).exists());
+                if found_in_exe_dir {
+                    exe_dir.to_path_buf()
+                } else {
+                    // Approach 2: Use sidecar path's parent directory
+                    let ffmpeg_binary_path = get_sidecar_path(&app, "ffmpeg")?;
+                    ffmpeg_binary_path
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or(ffmpeg_binary_path)
+                }
+            } else {
+                // Fallback to sidecar method
+                let ffmpeg_binary_path = get_sidecar_path(&app, "ffmpeg")?;
+                ffmpeg_binary_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or(ffmpeg_binary_path)
+            }
+        } else {
+            // Fallback to sidecar method
+            let ffmpeg_binary_path = get_sidecar_path(&app, "ffmpeg")?;
+            ffmpeg_binary_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or(ffmpeg_binary_path)
+        }
+    };
     
     let download_id = options.id.clone();
     
@@ -597,7 +641,7 @@ async fn download_video_internal(
         .arg("-f")
         .arg(&format_selector)
         .arg("--ffmpeg-location")
-        .arg(&ffmpeg_path)
+        .arg(&ffmpeg_location)
         .arg("--merge-output-format")
         .arg("mp4")
         .arg("-o")
