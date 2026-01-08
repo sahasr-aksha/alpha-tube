@@ -520,9 +520,7 @@ function App() {
           </button>
         </nav>
 
-        <div className="text-xs text-gray-600 text-center pb-2 select-none">
-          {!sidebarCollapsed && "v0.1.0-alpha"}
-        </div>
+
       </aside>
 
       {/* Main Area - Transparent to show Desktop (Acrylic) */}
