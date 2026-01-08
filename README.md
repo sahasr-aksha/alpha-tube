@@ -41,9 +41,8 @@
 | Feature | Description |
 |---------|-------------|
 | ⚡ **Super Fast** | Native Windows performance with Rust backend (Zoom zoom!) |
-| 🌸 **Kawaii UI** | Modern glassmorphism design that's pleasing to the eyes |
 | 🎥 **Universal** | Works with YouTube, TikTok, Instagram & 1000+ sites |
-| � **HD Quality** | Crystal clear 4K, 1080p downloads |
+| ✨ **HD Quality** | Crystal clear 4K, 1080p downloads |
 | 🎵 **MP3 Support** | Extract music in high quality audio format |
 | 🍿 **Built-in Player** | Watch your videos directly in the app |
 | 🌙 **Modern Dark UI** | Sleek glassmorphism design that's easy on the eyes |
