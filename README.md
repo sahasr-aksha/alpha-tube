@@ -51,7 +51,6 @@
 
 ---
 
-## 📸 Screenshots
 
 ## 📸 Screenshots
 
