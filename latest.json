@@ -1,0 +1,11 @@
+{
+  "version": "0.1.5",
+  "notes": "1) A dedicated settings option for better updates\n2) More Robust error handeling\n3) Integrated online streaming\n4) Better search feature now no need for URLs",
+  "pub_date": "2026-01-13T06:20:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUa3lHVndEYVhINWNnREl0bDhXZmxQb2dvTHhLcTd6d2tGS0owZHF3K0dsb3d6Ti9ZVFR3aDhPd3NjcWJtekEzYkd6NWpwNXRjVVlud2tnZzdseURMVWlncHpiR05oS1FBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzY4Mjg1NjA5CWZpbGU6QWxwaGEgVHViZV8wLjEuNV94NjQtc2V0dXAuZXhlCmVhQ1dReXJtcVU3L0NOL084TCtVc1QwMDRvaFcwVTdkZEZ4VUd4cGZCSCt2MVhIMjNydjV5UkswU1JDWDRlNkdSR2xoM2k2QXdKVUtPR1RIbXBWR0F3PT0K",
+      "url": "https://github.com/sahasr-aksha/alpha-tube/releases/download/v0.1.5/Alpha.Tube_0.1.5_x64-setup.exe"
+    }
+  }
+}

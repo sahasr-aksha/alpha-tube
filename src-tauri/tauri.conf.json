@@ -1,14 +1,17 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Alpha Tube",
-  "version": "0.1.3",
+  "version": "0.1.5",
   "identifier": "com.sahasr-aksha.alpha-tube",
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU1QzdBNTBENzA2NUM4RTQKUldUa3lHVndEYVhINWFBM3JjYTNHbUN1RDJ4Nnd0MUhUaU5xWWRsclhSa2lDcUV0dHRtK0NpL2YK",
       "endpoints": [
         "https://github.com/sahasr-aksha/alpha-tube/releases/latest/download/latest.json"
-      ]
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   },
   "build": {
@@ -59,7 +62,8 @@
     "externalBin": [
       "bin/yt-dlp",
       "bin/ffmpeg",
-      "bin/ffprobe"
+      "bin/ffprobe",
+      "bin/aria2c"
     ],
     "resources": {
       "bin/WebView2Loader.dll": "./"

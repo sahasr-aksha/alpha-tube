@@ -1,12 +1,16 @@
+#![allow(dead_code)]
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-use regex::Regex;
+mod search;
+mod progress;
+mod playlist;
+mod download_manager;
+mod stream_proxy;
+mod url_cache;
+
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-use std::sync::mpsc;
-use std::thread;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -16,6 +20,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri_plugin_updater::UpdaterExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 // Config for persistence
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -51,6 +57,8 @@ pub struct DownloadProgress {
     pub eta: String,
     pub status: String, // "downloading", "processing", "complete", "error"
     pub filename: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>, // User-friendly error message when status is "error"
 }
 
 #[derive(Clone, Serialize)]
@@ -63,6 +71,7 @@ pub struct VideoFormat {
     pub vcodec: String,
     pub acodec: String,
     pub note: String,
+    pub tbr: f64,  // Total bitrate in kbps
 }
 
 #[derive(Deserialize, Clone, Serialize, Debug)]
@@ -74,10 +83,10 @@ pub struct DownloadOptions {
     pub format_id: Option<String>, // Optional specific format ID
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 pub struct DownloadState {
     pub options: DownloadOptions,
-    pub child_pid: u32,
+    pub should_cancel: Arc<AtomicBool>,
     pub paused: bool,
     pub current_filename: Option<String>,
 }
@@ -93,6 +102,15 @@ pub struct PlaybackState {
 }
 
 pub type PlaybackManager = Mutex<HashMap<String, PlaybackState>>;
+
+/// Response for get_all_streaming_urls - contains URLs for all available qualities
+#[derive(Clone, Serialize)]
+pub struct StreamingUrls {
+    pub urls: HashMap<String, String>,  // "480p" -> "https://..." (raw YouTube URLs for backend use)
+    pub available: Vec<String>,          // ["360p", "480p", "720p", "1080p"]
+    pub default_quality: String,         // "480p" - recommended default
+    pub proxy_url: String,               // "http://127.0.0.1:9876/stream" - USE THIS FOR PLAYBACK
+}
 
 // New Commands for File Management
 
@@ -118,50 +136,35 @@ async fn cancel_download(
     let mut manager = state.lock().unwrap();
     
     if let Some(download_state) = manager.get(&id) {
-        let pid = download_state.child_pid;
+        // Signal cancellation
+        download_state.should_cancel.store(true, Ordering::Relaxed);
+        
         let output_path = download_state.options.output_path.clone(); // Directory
         let filename = download_state.current_filename.clone();
 
-        // Kill the process (Process Tree)
-        #[cfg(target_os = "windows")]
-        {
-            let _ = Command::new("taskkill")
-                .creation_flags(0x08000000)
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output();
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = Command::new("kill")
-                .arg(pid.to_string())
-                .output();
-        }
-        
         // Remove from state immediately
         manager.remove(&id);
 
         // CLEANUP FILES
         if let Some(fname) = filename {
-            let encoded_fname = fname; 
-            // construct paths
-            let base = std::path::Path::new(&output_path).join(&encoded_fname);
-            let part = std::path::Path::new(&output_path).join(format!("{}.part", encoded_fname));
-            let ytdl = std::path::Path::new(&output_path).join(format!("{}.ytdl", encoded_fname));
-            
-            // Try deleting all variants
+            // Simplified cleanup - download manager handles some, but we can double check
+            let base = std::path::Path::new(&output_path).join(&fname);
+            let part = std::path::Path::new(&output_path).join(format!("{}.part", fname));
+            let ytdl = std::path::Path::new(&output_path).join(format!("{}.ytdl", fname));
             let _ = fs::remove_file(base);
             let _ = fs::remove_file(part);
             let _ = fs::remove_file(ytdl);
         }
         
-        // Emit cancelled event (optional, or just error status)
+        // Emit cancelled event
         let _ = app.emit("download-progress", DownloadProgress {
             id: id.clone(),
             percent: 0.0,
             speed: String::new(),
             eta: String::new(),
-            status: "cancelled".to_string(), // Frontend should handle this removal
+            status: "cancelled".to_string(),
             filename: String::new(),
+            error_message: None,
         });
         
         Ok("Download cancelled".to_string())
@@ -320,71 +323,570 @@ fn get_sidecar_path(app: &AppHandle, name: &str) -> Result<std::path::PathBuf, S
     ))
 }
 
+/// Log download errors to a file for debugging
+fn log_download_error(download_id: &str, phase: &str, message: &str) {
+    use std::io::Write;
+    
+    let log_dir = std::path::Path::new("logs");
+    let _ = std::fs::create_dir_all(log_dir);
+    
+    let path = log_dir.join("download_errors.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path) 
+    {
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(file, "[{}] [{}] {}: {}", timestamp, download_id, phase, message);
+    }
+}
 
-/// Parse progress from yt-dlp output line
+/// Parse progress from yt-dlp output line using robust regex patterns
 fn parse_progress(line: &str) -> Option<DownloadProgress> {
-    // Match patterns like: [download]  45.2% of 10.5MiB at 1.2MiB/s ETA 00:05
-    let download_regex = Regex::new(
-        r"\[download\]\s+(\d+\.?\d*)%\s+of\s+~?\s*([\d.]+\w+)\s+at\s+([\d.]+\w+/s)(?:\s+ETA\s+(\S+))?"
-    ).ok()?;
+    use progress::{parse_progress_line, ProgressUpdate};
     
-    if let Some(caps) = download_regex.captures(line) {
-        let percent: f64 = caps.get(1)?.as_str().parse().ok()?;
-        let speed = caps.get(3).map(|m| m.as_str().to_string()).unwrap_or_default();
-        let eta = caps.get(4).map(|m| m.as_str().to_string()).unwrap_or_default();
+    match parse_progress_line(line) {
+        Some(ProgressUpdate::Progress { percent, speed, eta }) => {
+            Some(DownloadProgress {
+                id: String::new(), // Placeholder, to be filled by caller
+                percent,
+                speed,
+                eta,
+                status: "downloading".to_string(),
+                filename: String::new(),
+                error_message: None,
+            })
+        }
+        Some(ProgressUpdate::Destination(filename)) => {
+            Some(DownloadProgress {
+                id: String::new(),
+                percent: 0.0,
+                speed: String::new(),
+                eta: String::new(),
+                status: "downloading".to_string(),
+                filename,
+                error_message: None,
+            })
+        }
+        Some(ProgressUpdate::Muxing) => {
+            Some(DownloadProgress {
+                id: String::new(),
+                percent: 99.0, // Near complete, muxing is final step
+                speed: String::new(),
+                eta: String::new(),
+                status: "muxing".to_string(), // Distinct status for muxing phase
+                filename: String::new(),
+                error_message: None,
+            })
+        }
+        Some(ProgressUpdate::Completed) => {
+            Some(DownloadProgress {
+                id: String::new(),
+                percent: 100.0,
+                speed: String::new(),
+                eta: String::new(),
+                status: "complete".to_string(),
+                filename: String::new(),
+                error_message: None,
+            })
+        }
+        None => None,
+    }
+}
+
+/// Get streaming URL for playback without downloading
+/// Returns a local proxy URL that streams the video with proper auth headers
+#[tauri::command]
+async fn get_streaming_url(
+    app: AppHandle, 
+    video_url: String, 
+    _quality: String,
+    proxy_state: State<'_, Arc<stream_proxy::StreamProxy>>,
+) -> Result<String, String> {
+    let yt_dlp_path = get_sidecar_path(&app, "yt-dlp")?;
+
+    // Use combined formats (video+audio) for streaming
+    let format_selector = "22/18/best[ext=mp4][vcodec^=avc][acodec^=mp4a]/best[ext=mp4]/best";
+
+    println!("[Streaming] Fetching URL for: {} with format: {}", video_url, format_selector);
+
+    let mut cmd = Command::new(&yt_dlp_path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+
+    cmd.arg(&video_url)
+        .arg("-g") // Get URL only
+        .arg("-f")
+        .arg(format_selector)
+        .arg("--no-playlist")
+        .arg("--socket-timeout")
+        .arg("15")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output()
+        .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("[Streaming] Error: {}", stderr);
+        return Err(format!("Failed to get streaming URL: {}", stderr));
+    }
+
+    let url_output = String::from_utf8_lossy(&output.stdout);
+    let streaming_url = url_output
+        .lines()
+        .next()
+        .ok_or("No streaming URL returned")?
+        .trim()
+        .to_string();
+
+    println!("[Streaming] Got URL: {}...", &streaming_url.chars().take(80).collect::<String>());
+
+    // Set the URL in proxy state (headers will be added by proxy)
+    proxy_state.set_url(streaming_url, vec![]).await;
+
+    // Return local proxy URL for frontend to use
+    let local_url = proxy_state.get_local_url();
+    println!("[Streaming] Returning proxy URL: {}", local_url);
+    
+    Ok(local_url)
+}
+
+/// Get streaming URLs for ALL quality levels at once
+/// Returns URLs for 360p, 480p, 720p, 1080p - allows instant quality switching
+/// Also sets the default quality in the proxy and returns proxy URL (like original get_streaming_url)
+#[tauri::command]
+async fn get_all_streaming_urls(
+    app: AppHandle,
+    video_url: String,
+    proxy_state: State<'_, Arc<stream_proxy::StreamProxy>>,
+) -> Result<StreamingUrls, String> {
+    let yt_dlp_path = get_sidecar_path(&app, "yt-dlp")?;
+
+    println!("[Streaming] Fetching all quality URLs for: {}", video_url);
+
+    // Quality levels - use PROGRESSIVE formats only (not HLS/DASH)
+    // Format IDs: 18=360p, 22=720p are progressive. For others, filter protocol
+    // Using protocol filter to exclude m3u8/dash and only get https direct URLs
+    let qualities = [
+        ("360p", "18/best[height<=360][ext=mp4][acodec!=none][protocol^=http]"),
+        ("480p", "best[height<=480][ext=mp4][acodec!=none][protocol^=http]/18"),
+        ("720p", "22/best[height<=720][ext=mp4][acodec!=none][protocol^=http]"),
+        ("1080p", "best[height<=1080][ext=mp4][acodec!=none][protocol^=http]/22"),
+    ];
+
+    let mut urls: HashMap<String, String> = HashMap::new();
+    let mut available: Vec<String> = Vec::new();
+
+    // Fetch URLs for each quality
+    for (quality, format_selector) in qualities.iter() {
+        let mut cmd = Command::new(&yt_dlp_path);
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000);
+
+        cmd.arg(&video_url)
+            .arg("-g") // Get URL only, no download
+            .arg("-f")
+            .arg(format_selector)
+            .arg("--no-playlist")
+            .arg("--socket-timeout")
+            .arg("10")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = cmd.output();
         
-        return Some(DownloadProgress {
-            id: String::new(), // Placeholder, to be filled by caller
-            percent,
-            speed,
-            eta,
-            status: "downloading".to_string(),
-            filename: String::new(),
-        });
+        if let Ok(out) = output {
+            if out.status.success() {
+                let url_output = String::from_utf8_lossy(&out.stdout);
+                if let Some(url) = url_output.lines().next() {
+                    let url = url.trim().to_string();
+                    if !url.is_empty() {
+                        println!("[Streaming] Got {} URL", quality);
+                        urls.insert(quality.to_string(), url);
+                        available.push(quality.to_string());
+                    }
+                }
+            } else {
+                println!("[Streaming] {} not available for this video", quality);
+            }
+        }
+    }
+
+    if urls.is_empty() {
+        return Err("No streaming URLs available for any quality".to_string());
+    }
+
+    // Determine default quality (prefer 480p for bandwidth, fallback to highest available)
+    let default_quality = if available.contains(&"480p".to_string()) {
+        "480p".to_string()
+    } else if available.contains(&"360p".to_string()) {
+        "360p".to_string()
+    } else {
+        available.first().cloned().unwrap_or("480p".to_string())
+    };
+
+    // SET THE DEFAULT URL IN PROXY (like original get_streaming_url did)
+    if let Some(default_url) = urls.get(&default_quality) {
+        println!("[Streaming] Setting proxy to default quality: {}", default_quality);
+        proxy_state.set_url(default_url.clone(), vec![]).await;
+    }
+
+    // Get the proxy URL to return
+    let proxy_url = proxy_state.get_local_url();
+    println!("[Streaming] Available: {:?}, default: {}, proxy: {}", available, default_quality, proxy_url);
+
+    Ok(StreamingUrls {
+        urls,
+        available,
+        default_quality,
+        proxy_url,
+    })
+}
+
+/// Set the stream URL in the proxy - used when switching quality
+/// Frontend calls this with pre-fetched URL to instantly switch quality
+#[tauri::command]
+async fn set_stream_url(
+    url: String,
+    proxy_state: State<'_, Arc<stream_proxy::StreamProxy>>,
+) -> Result<String, String> {
+    println!("[Streaming] Switching to new URL: {}...", &url.chars().take(60).collect::<String>());
+    
+    // Update the proxy with the new URL
+    proxy_state.set_url(url, vec![]).await;
+    
+    // Return the local proxy URL (same endpoint, different content)
+    Ok(proxy_state.get_local_url())
+}
+
+/// Response for start_streaming - immediate playback with single quality
+#[derive(Clone, Serialize)]
+pub struct StartStreamingResponse {
+    pub proxy_url: String,      // USE THIS for immediate playback
+    pub quality: String,        // The quality being streamed (e.g., "360p")
+}
+
+/// Response for quality availability event
+#[derive(Clone, Serialize)]
+pub struct QualityAvailable {
+    pub quality: String,        // e.g., "720p"
+}
+
+/// Response for the unified stream_video command
+#[derive(Clone, Serialize)]
+pub struct StreamResponse {
+    pub proxy_url: String,              // Proxy URL for playback
+    pub current_quality: String,        // Quality being streamed
+    pub available_qualities: Vec<String>, // All available qualities
+}
+
+/// Unified streaming command - handles initial playback AND quality switching
+/// - quality = None: Start with 360p default
+/// - quality = Some("720p"): Switch to specific quality (force fresh fetch)
+#[tauri::command]
+async fn stream_video(
+    app: AppHandle,
+    video_url: String,
+    quality: Option<String>,
+    proxy_state: State<'_, Arc<stream_proxy::StreamProxy>>,
+    url_cache: State<'_, Arc<url_cache::UrlCache>>,
+) -> Result<StreamResponse, String> {
+    let yt_dlp_path = get_sidecar_path(&app, "yt-dlp")?;
+    
+    // Determine if this is an initial load or quality switch
+    let is_quality_switch = quality.is_some();
+    
+    // Default to 360p for fastest start
+    let target_quality = quality.unwrap_or_else(|| "360p".to_string());
+    
+    println!("[Streaming] stream_video called - url:{} quality:{} is_switch:{}", 
+        &video_url[..50.min(video_url.len())], target_quality, is_quality_switch);
+    
+    // Get URL - force fresh if switching quality to ensure correct URL
+    let streaming_url = if is_quality_switch {
+        // Quality switch: ALWAYS get fresh URL to ensure correct quality
+        url_cache.get_or_fetch_fresh(&yt_dlp_path, &video_url, &target_quality).await?
+    } else {
+        // Initial load: use cache if available
+        url_cache.get_or_fetch(&yt_dlp_path, &video_url, &target_quality).await?
+    };
+    
+    // Log the EXACT URL being set in proxy
+    let url_hash: u64 = streaming_url.bytes().fold(0u64, |acc, b| acc.wrapping_add(b as u64));
+    println!("[Streaming] Setting proxy URL for {} - hash:{} url:{}...", 
+        target_quality, url_hash, &streaming_url[..80.min(streaming_url.len())]);
+    
+    // Update proxy with the new URL
+    proxy_state.set_url(streaming_url, vec![]).await;
+    
+    // Get available qualities from cache
+    let available = fetch_available_qualities_sync(&app, &video_url, &url_cache).await;
+    
+    println!("[Streaming] Returning - quality:{} available:{:?}", target_quality, available);
+    
+    Ok(StreamResponse {
+        proxy_url: proxy_state.get_local_url(),
+        current_quality: target_quality,
+        available_qualities: available,
+    })
+}
+
+/// Fetch available qualities (quick check, no full fetch)
+async fn fetch_available_qualities_sync(
+    app: &AppHandle,
+    video_url: &str,
+    url_cache: &Arc<url_cache::UrlCache>,
+) -> Vec<String> {
+    let _yt_dlp_path = match get_sidecar_path(app, "yt-dlp") {
+        Ok(p) => p,
+        Err(_) => return vec!["360p".to_string()],
+    };
+    
+    let qualities = ["360p", "480p", "720p", "1080p"];
+    let mut available = Vec::new();
+    
+    // Check which qualities are already cached
+    for q in qualities.iter() {
+        if url_cache.get(video_url, q).await.is_some() {
+            available.push(q.to_string());
+        }
     }
     
-    // Check for destination filename
-    if line.contains("[download] Destination:") {
-        let filename = line
-            .split("Destination:")
-            .nth(1)
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        return Some(DownloadProgress {
-            id: String::new(),
-            percent: 0.0,
-            speed: String::new(),
-            eta: String::new(),
-            status: "downloading".to_string(),
-            filename,
-        });
+    // Always include 360p as it's guaranteed
+    if !available.contains(&"360p".to_string()) {
+        available.push("360p".to_string());
     }
     
-    // Check for merging/processing
-    if line.contains("[Merger]") || line.contains("[ExtractAudio]") || line.contains("[ffmpeg]") {
-        return Some(DownloadProgress {
-            id: String::new(),
-            percent: 100.0,
-            speed: String::new(),
-            eta: String::new(),
-            status: "processing".to_string(),
-            filename: String::new(),
-        });
+    // Sort by resolution
+    available.sort_by(|a, b| {
+        let a_num: u32 = a.replace("p", "").parse().unwrap_or(0);
+        let b_num: u32 = b.replace("p", "").parse().unwrap_or(0);
+        a_num.cmp(&b_num)
+    });
+    
+    available
+}
+
+/// Fetch all quality URLs in background and emit events
+#[tauri::command]
+async fn fetch_all_qualities(
+    app: AppHandle,
+    video_url: String,
+    url_cache: State<'_, Arc<url_cache::UrlCache>>,
+) -> Result<Vec<String>, String> {
+    let yt_dlp_path = get_sidecar_path(&app, "yt-dlp")?;
+    let url_cache = url_cache.inner().clone();
+    
+    println!("[Streaming] Fetching all qualities in background...");
+    
+    let qualities = ["360p", "480p", "720p", "1080p"];
+    let mut available = Vec::new();
+    
+    for quality in qualities.iter() {
+        match url_cache.get_or_fetch(&yt_dlp_path, &video_url, quality).await {
+            Ok(_) => {
+                available.push(quality.to_string());
+                // Emit event so frontend knows this quality is ready
+                let _ = app.emit("quality-ready", QualityAvailable {
+                    quality: quality.to_string(),
+                });
+            }
+            Err(e) => {
+                println!("[Streaming] {} not available: {}", quality, e);
+            }
+        }
     }
     
-    // Check for already downloaded
-    if line.contains("has already been downloaded") {
-        return Some(DownloadProgress {
-            id: String::new(),
-            percent: 100.0,
-            speed: String::new(),
-            eta: String::new(),
-            status: "complete".to_string(),
-            filename: String::new(),
-        });
+    println!("[Streaming] Available qualities: {:?}", available);
+    Ok(available)
+}
+
+/// Start streaming immediately with 360p (lowest latency)
+/// Returns proxy URL for instant playback - player can start within 1-2 seconds
+#[tauri::command]
+async fn start_streaming(
+    app: AppHandle,
+    video_url: String,
+    proxy_state: State<'_, Arc<stream_proxy::StreamProxy>>,
+) -> Result<StartStreamingResponse, String> {
+    let yt_dlp_path = get_sidecar_path(&app, "yt-dlp")?;
+
+    println!("[Streaming] Starting immediate 360p stream for: {}", video_url);
+
+    // Use 360p for fastest start - progressive format with audio
+    let format_selector = "18/best[height<=360][ext=mp4][acodec!=none][protocol^=http]";
+
+    let mut cmd = Command::new(&yt_dlp_path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+
+    cmd.arg(&video_url)
+        .arg("-g") // Get URL only
+        .arg("-f")
+        .arg(format_selector)
+        .arg("--no-playlist")
+        .arg("--socket-timeout")
+        .arg("10")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output()
+        .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("[Streaming] Error getting 360p: {}", stderr);
+        return Err(format!("Failed to get streaming URL: {}", stderr));
     }
+
+    let url_output = String::from_utf8_lossy(&output.stdout);
+    let streaming_url = url_output
+        .lines()
+        .next()
+        .ok_or("No streaming URL returned")?
+        .trim()
+        .to_string();
+
+    println!("[Streaming] Got 360p URL, setting in proxy...");
+
+    // Set in proxy for immediate playback
+    proxy_state.set_url(streaming_url, vec![]).await;
+
+    Ok(StartStreamingResponse {
+        proxy_url: proxy_state.get_local_url(),
+        quality: "360p".to_string(),
+    })
+}
+
+/// Fetch remaining quality URLs in background and emit events as each becomes available
+/// Call this AFTER playback has started to progressively load quality options
+#[tauri::command]
+async fn fetch_remaining_qualities(
+    app: AppHandle,
+    video_url: String,
+) -> Result<(), String> {
+    let yt_dlp_path = get_sidecar_path(&app, "yt-dlp")?;
+
+    println!("[Streaming] Fetching remaining qualities in background...");
+
+    // Qualities to fetch (excluding 360p which is already playing)
+    let qualities = [
+        ("480p", "best[height<=480][ext=mp4][acodec!=none][protocol^=http]/18"),
+        ("720p", "22/best[height<=720][ext=mp4][acodec!=none][protocol^=http]"),
+        ("1080p", "best[height<=1080][ext=mp4][acodec!=none][protocol^=http]/22"),
+    ];
+
+    // Spawn background task to fetch each quality
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        for (quality, format_selector) in qualities.iter() {
+            let mut cmd = Command::new(&yt_dlp_path);
+            #[cfg(target_os = "windows")]
+            cmd.creation_flags(0x08000000);
+
+            cmd.arg(&video_url)
+                .arg("-g")
+                .arg("-f")
+                .arg(format_selector)
+                .arg("--no-playlist")
+                .arg("--socket-timeout")
+                .arg("10")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            let output = cmd.output();
+
+            if let Ok(out) = output {
+                if out.status.success() {
+                    let url_output = String::from_utf8_lossy(&out.stdout);
+                    if let Some(url) = url_output.lines().next() {
+                        let url = url.trim().to_string();
+                        if !url.is_empty() {
+                            println!("[Streaming] {} available", quality);
+                            
+                            // Emit event to frontend
+                            let _ = app_clone.emit("quality-available", QualityAvailable {
+                                quality: quality.to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    println!("[Streaming] {} not available for this video", quality);
+                }
+            }
+        }
+        println!("[Streaming] Finished fetching all qualities");
+    });
+
+    Ok(())
+}
+
+/// Switch to a different quality - fetches fresh URL if needed for reliability
+/// cached_url can be provided for instant switch, but will re-fetch if it fails
+#[tauri::command]
+async fn switch_quality(
+    app: AppHandle,
+    video_url: String,
+    quality: String,
+    cached_url: Option<String>,
+    proxy_state: State<'_, Arc<stream_proxy::StreamProxy>>,
+) -> Result<String, String> {
+    println!("[Streaming] Switching to quality: {}", quality);
+
+    // Try cached URL first if provided
+    if let Some(url) = cached_url {
+        println!("[Streaming] Using cached URL for {}", quality);
+        proxy_state.set_url(url, vec![]).await;
+        return Ok(proxy_state.get_local_url());
+    }
+
+    // No cached URL or need fresh fetch
+    let yt_dlp_path = get_sidecar_path(&app, "yt-dlp")?;
     
-    None
+    let format_selector = match quality.as_str() {
+        "360p" => "18/best[height<=360][ext=mp4][acodec!=none][protocol^=http]",
+        "480p" => "best[height<=480][ext=mp4][acodec!=none][protocol^=http]/18",
+        "720p" => "22/best[height<=720][ext=mp4][acodec!=none][protocol^=http]",
+        "1080p" => "best[height<=1080][ext=mp4][acodec!=none][protocol^=http]/22",
+        _ => "best[ext=mp4][acodec!=none][protocol^=http]",
+    };
+
+    println!("[Streaming] Fetching fresh URL for {}", quality);
+
+    let mut cmd = Command::new(&yt_dlp_path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+
+    cmd.arg(&video_url)
+        .arg("-g")
+        .arg("-f")
+        .arg(format_selector)
+        .arg("--no-playlist")
+        .arg("--socket-timeout")
+        .arg("10")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output()
+        .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to get {} URL: {}", quality, stderr));
+    }
+
+    let url_output = String::from_utf8_lossy(&output.stdout);
+    let streaming_url = url_output
+        .lines()
+        .next()
+        .ok_or("No streaming URL returned")?
+        .trim()
+        .to_string();
+
+    proxy_state.set_url(streaming_url, vec![]).await;
+    Ok(proxy_state.get_local_url())
 }
 
 /// Convert quality string to yt-dlp format selector
@@ -399,6 +901,47 @@ fn get_format_selector(quality: &str) -> String {
         "2160p" | "4k" => "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/best[height<=2160][ext=mp4]/best[height<=2160]".to_string(),
         "best" | _ => "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best".to_string(),
     }
+}
+
+/// Check if a format's codecs are compatible with our bundled FFmpeg build
+/// Our custom FFmpeg has: H.264, HEVC, VP8, VP9 video decoders; AAC, MP3, Opus, Vorbis audio decoders
+/// Missing: AV1 video decoder, MKV muxer
+fn is_ffmpeg_compatible(vcodec: &str, acodec: &str, ext: &str) -> bool {
+    let vcodec_lower = vcodec.to_lowercase();
+    let acodec_lower = acodec.to_lowercase();
+    let ext_lower = ext.to_lowercase();
+    
+    // Supported video codecs (our FFmpeg build includes these decoders)
+    let video_ok = vcodec_lower == "none" 
+        || vcodec_lower.contains("avc") 
+        || vcodec_lower.contains("h264")
+        || vcodec_lower.contains("hevc") 
+        || vcodec_lower.contains("hev1")
+        || vcodec_lower.contains("hvc1")
+        || vcodec_lower.contains("vp8") 
+        || vcodec_lower.contains("vp9")
+        || vcodec_lower.contains("vp09");
+    
+    // AV1 is NOT supported - explicitly reject
+    if vcodec_lower.contains("av01") || vcodec_lower.contains("av1") {
+        return false;
+    }
+    
+    // Supported audio codecs
+    let audio_ok = acodec_lower == "none"
+        || acodec_lower.contains("aac")
+        || acodec_lower.contains("mp4a")
+        || acodec_lower.contains("mp3")
+        || acodec_lower.contains("opus")
+        || acodec_lower.contains("vorbis")
+        || acodec_lower.contains("ac3")
+        || acodec_lower.contains("eac3")
+        || acodec_lower.contains("flac");
+    
+    // Supported container formats (muxers we have)
+    let ext_ok = matches!(ext_lower.as_str(), "mp4" | "m4a" | "webm" | "mov" | "mp3" | "ogg" | "3gp");
+    
+    video_ok && audio_ok && ext_ok
 }
 
 /// Fetch video metadata for a URL (Title, Thumbnail, Duration, Formats)
@@ -520,9 +1063,15 @@ async fn get_video_metadata(app: AppHandle, url: String) -> Result<VideoMetadata
         let vcodec = fmt["vcodec"].as_str().unwrap_or("none").to_string();
         let acodec = fmt["acodec"].as_str().unwrap_or("none").to_string();
         let note = fmt["format_note"].as_str().unwrap_or("").to_string();
+        let tbr = fmt["tbr"].as_f64().unwrap_or(0.0);
         
         // Filter out obviously bad stuff or storyboards
         if format_id.contains("sb") || ext == "mhtml" {
+            continue;
+        }
+        
+        // Filter out formats our bundled FFmpeg cannot mux (e.g., AV1, MKV)
+        if !is_ffmpeg_compatible(&vcodec, &acodec, &ext) {
             continue;
         }
 
@@ -542,6 +1091,7 @@ async fn get_video_metadata(app: AppHandle, url: String) -> Result<VideoMetadata
                 vcodec,
                 acodec,
                 note,
+                tbr,
             });
         }
     }
@@ -556,258 +1106,311 @@ async fn get_video_metadata(app: AppHandle, url: String) -> Result<VideoMetadata
     })
 }
 
-/// Internal helper to run the download process
+/// Update yt-dlp binary
+#[tauri::command]
+async fn update_ytdlp(app: AppHandle) -> Result<String, String> {
+    let yt_dlp_path = get_sidecar_path(&app, "yt-dlp")?;
+    
+    println!("Updating yt-dlp at: {:?}", yt_dlp_path);
+    
+    // Command: yt-dlp -U
+    let mut cmd = Command::new(&yt_dlp_path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+
+    cmd.arg("-U")
+       .stdout(Stdio::piped())
+       .stderr(Stdio::piped());
+
+    let output = cmd.output()
+        .map_err(|e| format!("Failed to run update command: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    
+    if !output.status.success() {
+        return Err(format!("Update failed: {} {}", stdout, stderr));
+    }
+    
+    Ok(format!("{}\n{}", stdout, stderr))
+}
+
+// ========== APP UPDATE COMMANDS ==========
+
+#[derive(Clone, Serialize)]
+struct AppUpdateInfo {
+    version: String,
+    notes: String,
+    download_url: String,
+    current_version: String,
+    update_available: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct AppUpdateProgress {
+    percent: f64,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    status: String,
+}
+
+/// Check if app update is available by fetching latest.json from GitHub
+#[tauri::command]
+async fn check_app_update() -> Result<AppUpdateInfo, String> {
+    let current_version = env!("CARGO_PKG_VERSION");
+    let endpoint = "https://github.com/sahasr-aksha/alpha-tube/releases/latest/download/latest.json";
+    
+    // Simple HTTP GET using ureq (sync) or we can shell out to curl
+    // Using std::process::Command with curl for simplicity (no new deps)
+    let mut cmd = Command::new("curl");
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+    
+    let output = cmd.args(["-sL", endpoint])
+        .output()
+        .map_err(|e| format!("Network error: {}", e))?;
+    
+    if !output.status.success() {
+        return Err("Failed to fetch update info".to_string());
+    }
+    
+    let body = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Parse error: {}", e))?;
+    
+    let remote_version = json["version"].as_str().unwrap_or("0.0.0");
+    let notes = json["notes"].as_str().unwrap_or("");
+    let download_url = json["platforms"]["windows-x86_64"]["url"]
+        .as_str()
+        .unwrap_or("");
+    
+    // Simple version comparison (works for semver x.y.z)
+    let update_available = remote_version > current_version;
+    
+    println!("[App Update] Current: {}, Remote: {}, Available: {}", 
+             current_version, remote_version, update_available);
+    
+    Ok(AppUpdateInfo {
+        version: remote_version.to_string(),
+        notes: notes.to_string(),
+        download_url: download_url.to_string(),
+        current_version: current_version.to_string(),
+        update_available,
+    })
+}
+
+/// Download app update using aria2c for fast parallel download with progress
+#[tauri::command]
+async fn download_app_update(app: AppHandle, download_url: String) -> Result<String, String> {
+    use std::io::{BufRead, BufReader};
+    use regex::Regex;
+    
+    let aria2_path = get_sidecar_path(&app, "aria2c")?;
+    
+    // Save to app cache directory
+    let cache_dir = app.path().app_cache_dir()
+        .map_err(|e| format!("Failed to get cache dir: {}", e))?;
+    
+    if !cache_dir.exists() {
+        fs::create_dir_all(&cache_dir)
+            .map_err(|e| format!("Failed to create cache dir: {}", e))?;
+    }
+    
+    let output_file = cache_dir.join("AlphaTube_update.exe");
+    
+    // Remove old update file if exists
+    if output_file.exists() {
+        let _ = fs::remove_file(&output_file);
+    }
+    
+    println!("[App Update] Downloading to: {:?}", output_file);
+    
+    let mut cmd = Command::new(&aria2_path);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+    
+    cmd.arg(&download_url)
+       .arg("-d").arg(&cache_dir)
+       .arg("-o").arg("AlphaTube_update.exe")
+       .arg("-c") // Continue if partial
+       .arg("--file-allocation=none")
+       .arg("--summary-interval=1")
+       .arg("--max-connection-per-server=16")
+       .arg("--split=16")
+       .arg("--min-split-size=1M")
+       .stdout(Stdio::piped())
+       .stderr(Stdio::piped());
+    
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("Failed to start aria2c: {}", e))?;
+    
+    let stdout = child.stdout.take()
+        .ok_or("Failed to capture stdout")?;
+    
+    let reader = BufReader::new(stdout);
+    let app_handle = app.clone();
+    
+    // Parse aria2c output for progress
+    let progress_re = Regex::new(r"\((\d+)%\)").unwrap();
+    
+    // Spawn thread to read output and emit progress
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    
+    std::thread::spawn(move || {
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                let _ = tx.send(l);
+            }
+        }
+    });
+    
+    loop {
+        // Check for output
+        while let Ok(line) = rx.try_recv() {
+            if let Some(caps) = progress_re.captures(&line) {
+                if let Some(m) = caps.get(1) {
+                    if let Ok(percent) = m.as_str().parse::<f64>() {
+                        let _ = app_handle.emit("app-update-progress", AppUpdateProgress {
+                            percent,
+                            downloaded_bytes: 0, // aria2c doesn't easily give this
+                            total_bytes: 0,
+                            status: "downloading".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        
+        // Check if process finished
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    // Emit completion
+                    let _ = app_handle.emit("app-update-progress", AppUpdateProgress {
+                        percent: 100.0,
+                        downloaded_bytes: 0,
+                        total_bytes: 0,
+                        status: "complete".to_string(),
+                    });
+                    println!("[App Update] Download complete");
+                    break;
+                } else {
+                    return Err("Download failed".to_string());
+                }
+            }
+            Ok(None) => {
+                // Still running
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(format!("Process error: {}", e));
+            }
+        }
+    }
+    
+    Ok(output_file.to_string_lossy().to_string())
+}
+
+/// Open the downloaded installer and exit app
+#[tauri::command]
+async fn install_app_update(installer_path: String) -> Result<(), String> {
+    println!("[App Update] Launching installer: {}", installer_path);
+    
+    #[cfg(target_os = "windows")]
+    {
+        // Use cmd /C start to launch installer in background
+        Command::new("cmd")
+            .creation_flags(0x08000000)
+            .args(["/C", "start", "", &installer_path])
+            .spawn()
+            .map_err(|e| format!("Failed to launch installer: {}", e))?;
+    }
+    
+    // Exit current app to allow installer to replace files
+    std::process::exit(0);
+}
+
 async fn download_video_internal(
     app: AppHandle,
     options: DownloadOptions,
     state: tauri::State<'_, DownloadManager>,
-    is_resume: bool,
+    _is_resume: bool, // Not used directly, but implicit in pipeline if implemented
 ) -> Result<String, String> {
-    let yt_dlp_path = get_sidecar_path(&app, "yt-dlp")?;
-    
-    // Get ffmpeg location - try multiple approaches for maximum compatibility
-    // yt-dlp's --ffmpeg-location can accept either a directory or full binary path
-    let ffmpeg_location = {
-        // Approach 1: Use executable directory directly (post-installation, binaries alongside exe)
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                // Check if ffmpeg exists in the exe directory
-                let possible_names = [
-                    "ffmpeg.exe",
-                    "ffmpeg-x86_64-pc-windows-msvc.exe",
-                    "ffmpeg-x86_64-pc-windows-gnu.exe",
-                ];
-                let found_in_exe_dir = possible_names.iter().any(|name| exe_dir.join(name).exists());
-                if found_in_exe_dir {
-                    exe_dir.to_path_buf()
-                } else {
-                    // Approach 2: Use sidecar path's parent directory
-                    let ffmpeg_binary_path = get_sidecar_path(&app, "ffmpeg")?;
-                    ffmpeg_binary_path
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or(ffmpeg_binary_path)
-                }
-            } else {
-                // Fallback to sidecar method
-                let ffmpeg_binary_path = get_sidecar_path(&app, "ffmpeg")?;
-                ffmpeg_binary_path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or(ffmpeg_binary_path)
-            }
-        } else {
-            // Fallback to sidecar method
-            let ffmpeg_binary_path = get_sidecar_path(&app, "ffmpeg")?;
-            ffmpeg_binary_path
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or(ffmpeg_binary_path)
-        }
-    };
-    
     let download_id = options.id.clone();
+    let should_cancel = Arc::new(AtomicBool::new(false));
     
-    let format_selector = if let Some(fid) = &options.format_id {
-        // If a specific format ID is requested
-        if options.quality.to_lowercase() == "mp3" {
-            "bestaudio/best".to_string() 
-        } else {
-            // Force merge this video format with best audio
-            format!("{}+bestaudio/best", fid)
-        }
-    } else {
-        // Use quality preset selector
-        get_format_selector(&options.quality)
-    };
+    // Validate dependencies
+    // download_pipeline checks them, but we want early fail?
+    // download_manager::download_pipeline handles checks.
     
-    // Build yt-dlp command
-    let mut cmd_builder = Command::new(&yt_dlp_path);
-    #[cfg(target_os = "windows")]
-    cmd_builder.creation_flags(0x08000000);
-    
-    // Resolve Output Path (Config Preference)
-    let final_output_path = if !is_resume {
-        // Only override if new download, otherwise use stored options output_path
-        // Actually, internal helper uses options.output_path directly. 
-        // We should update options.output_path in the caller (download_video) if config exists.
-        // For consistent logic, we just use options.output_path here.
-        &options.output_path
-    } else {
-         &options.output_path
-    };
-
-    cmd_builder.arg(&options.url)
-        .arg("-f")
-        .arg(&format_selector)
-        .arg("--ffmpeg-location")
-        .arg(&ffmpeg_location)
-        .arg("--merge-output-format")
-        .arg("mp4")
-        .arg("-o")
-        // Output template: playlist videos go in subfolder, singles stay at root
-        .arg(format!("{}/%(playlist_title,)s%(playlist_index|)s%(title)s.%(ext)s", final_output_path))
-        .arg("--newline") // Each progress update on new line
-        .arg("--no-colors") // Disable ANSI colors for easier parsing
-        .arg("--concurrent-fragments")
-        .arg("4")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    
-    // Add audio extraction if audio quality selected
-    if options.quality.to_lowercase() == "mp3" {
-        cmd_builder.arg("-x")
-        .arg("--audio-format")
-        .arg("mp3");
-    }
-
-    // Spawn command
-    let mut child = cmd_builder.spawn().map_err(|e| format!("Failed to spawn yt-dlp: {}", e))?;
-    let child_pid = child.id();
-
     // REGISTER DOWNLOAD IN STATE
     {
         let mut manager = state.lock().unwrap();
         manager.insert(download_id.clone(), DownloadState {
             options: options.clone(),
-            child_pid,
+            should_cancel: should_cancel.clone(),
             paused: false,
             current_filename: None,
         });
     }
     
-    let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
-    let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
-    
-    let (tx, rx) = mpsc::channel::<String>();
-    let tx_stderr = tx.clone();
-    
-    // Read stdout in a separate thread
-    let stdout_thread = thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                let _ = tx.send(line);
-            }
-        }
-    });
-    
-    // Read stderr in a separate thread
-    let stderr_thread = thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                let _ = tx_stderr.send(line);
-            }
-        }
-    });
-    
-    let mut last_filename = String::new();
-    let mut error_output = String::new();
-    
-    // Process output lines and emit progress events
-    while let Ok(line) = rx.recv() {
-        // Check for errors
-        if line.contains("ERROR:") {
-            error_output = line.clone();
-        }
-        
-        if let Some(mut progress) = parse_progress(&line) {
-            // Inject ID
-            progress.id = download_id.clone();
-
-            // Preserve filename across progress updates
-            if !progress.filename.is_empty() {
-                last_filename = progress.filename.clone();
-                // Update state with filename for cancellation cleanup
+    // Run pipeline
+    // We match the result to handle specific errors or completion
+    match download_manager::download_pipeline(app.clone(), options, should_cancel).await {
+        Ok(path) => {
+            // Success
+            // Remove from state
+            {
                 let mut manager = state.lock().unwrap();
-                if let Some(s) = manager.get_mut(&download_id) {
-                    s.current_filename = Some(last_filename.clone());
-                }
-            } else if !last_filename.is_empty() {
-                progress.filename = last_filename.clone();
+                manager.remove(&download_id);
             }
             
-            let _ = app.emit("download-progress", progress);
+            let _ = app.emit("download-progress", DownloadProgress {
+                id: download_id,
+                percent: 100.0,
+                speed: String::new(),
+                eta: String::new(),
+                status: "complete".to_string(),
+                filename: path.clone(),
+                error_message: None,
+            });
+            Ok(format!("Download complete: {}", path))
+        },
+        Err(e) => {
+            // Remove from state
+            {
+                let mut manager = state.lock().unwrap();
+                manager.remove(&download_id);
+            }
+            
+            match e {
+                download_manager::DownloadError::Cancelled => {
+                     let _ = app.emit("download-progress", DownloadProgress {
+                        id: download_id,
+                        percent: 0.0,
+                        speed: String::new(),
+                        eta: String::new(),
+                        status: "cancelled".to_string(),
+                        filename: String::new(),
+                        error_message: None,
+                    });
+                    Ok("Download cancelled".to_string())
+                },
+                _ => {
+                    let user_msg = e.user_message();
+                    let _ = app.emit("download-progress", DownloadProgress {
+                        id: download_id,
+                        percent: 0.0,
+                        speed: String::new(),
+                        eta: String::new(),
+                        status: "error".to_string(),
+                        filename: String::new(),
+                        error_message: Some(user_msg.clone()),
+                    });
+                    Err(format!("Download failed: {}", user_msg))
+                }
+            }
         }
-    }
-    
-    // Wait for threads to finish
-    let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
-    
-    // Wait for the process to finish
-    let status = child.wait().map_err(|e| format!("Failed to wait for yt-dlp: {}", e))?;
-    
-    // CHECK IF PAUSED
-    let is_paused = {
-        let manager = state.lock().unwrap();
-        if let Some(download_state) = manager.get(&download_id) {
-            download_state.paused
-        } else {
-            false
-        }
-    };
-
-    if is_paused {
-        // Do not cleanup state, do not emit error/complete
-        // The pause command has already updated the state to "paused"
-        // and emitted the "paused" event if needed.
-        
-        // CRITICAL FIX: Emit "paused" event again here.
-        // Reason: The `yt-dlp` process might have buffered output in the pipe (stdout/stderr)
-        // containing "downloading" status updates. These are processed by the reading threads
-        // *after* the process is killed but before this check.
-        // This causes the frontend to flip back to "downloading" state after the initial "paused" event.
-        // Emitting it here ensures the final state is correctly set to "paused".
-        let _ = app.emit("download-progress", DownloadProgress {
-            id: download_id,
-            percent: 0.0, // Frontend preserves previous percent
-            speed: String::new(),
-            eta: String::new(),
-            status: "paused".to_string(),
-            filename: String::new(),
-        });
-
-        return Ok("Download paused".to_string());
-    }
-
-    // CLEANUP STATE (Only if not paused)
-    {
-        let mut manager = state.lock().unwrap();
-        manager.remove(&download_id);
-    }
-
-    if status.success() {
-        // CLEANUP: Delete any leftover .part and .ytdl files on successful completion
-        if !last_filename.is_empty() {
-            let part_file = format!("{}.part", last_filename);
-            let ytdl_file = format!("{}.ytdl", last_filename);
-            let _ = fs::remove_file(&part_file);
-            let _ = fs::remove_file(&ytdl_file);
-        }
-        
-        // Emit completion event
-        let _ = app.emit("download-progress", DownloadProgress {
-            id: download_id,
-            percent: 100.0,
-            speed: String::new(),
-            eta: String::new(),
-            status: "complete".to_string(),
-            filename: last_filename.clone(),
-        });
-        Ok(format!("Download complete: {}", last_filename))
-    } else {
-        // Emit error event
-        let _ = app.emit("download-progress", DownloadProgress {
-            id: download_id,
-            percent: 0.0,
-            speed: String::new(),
-            eta: String::new(),
-            status: "error".to_string(),
-            filename: error_output.clone(),
-        });
-        Err(format!("Download failed: {}", error_output))
     }
 }
 
@@ -833,59 +1436,16 @@ async fn pause_download(
     id: String,
     state: State<'_, DownloadManager>,
 ) -> Result<String, String> {
-    let mut manager = state.lock().unwrap();
+    // Current architecture doesn't support pausing nicely (aria2 parallel).
+    // We treat pause as cancel, but maybe we can signal frontend that it's cancelled
+    // OR we just say "Pause not supported, please cancel"
+    // OR we just cancel it.
+    // For now, let's just error out to prompt usage of Cancel.
+    // Err("Pause is not supported in this beta build. Please cancel and restart.".to_string())
     
-    if let Some(download_state) = manager.get_mut(&id) {
-        if download_state.paused {
-            return Ok("Download already paused".to_string());
-        }
-        
-        let pid = download_state.child_pid;
-        
-        // Kill the process
-        #[cfg(target_os = "windows")]
-        {
-            let output = Command::new("taskkill")
-                .creation_flags(0x08000000)
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output();
-                
-            match output {
-                Ok(o) => {
-                    if !o.status.success() {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        println!("Failed to kill process {}: {}", pid, stderr);
-                    } else {
-                        println!("Successfully killed process {}", pid);
-                    }
-                },
-                Err(e) => println!("Failed to execute taskkill: {}", e),
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = Command::new("kill")
-                .arg(pid.to_string())
-                .output();
-        }
-        
-        // Update state
-        download_state.paused = true;
-        
-        // Emit paused event
-        let _ = app.emit("download-progress", DownloadProgress {
-            id: id.clone(),
-            percent: 0.0, // Placeholder
-            speed: String::new(),
-            eta: String::new(),
-            status: "paused".to_string(),
-            filename: String::new(), // Frontend has filename
-        });
-        
-        Ok("Download paused".to_string())
-    } else {
-        Err("Download not active".to_string())
-    }
+    // Actually, user might want to stop network usage. Cancel does that.
+    
+    cancel_download(app, id, state).await.map(|_| "Download cancelled (Pause not supported)".to_string())
 }
 
 #[tauri::command]
@@ -918,6 +1478,7 @@ async fn resume_download(
         eta: String::new(),
         status: "downloading".to_string(), // Switch back to downloading
         filename: String::new(),
+        error_message: None,
     });
 
     download_video_internal(app, options, state, true).await
@@ -1767,6 +2328,19 @@ pub fn run() {
             app.manage(std::sync::Mutex::new(std::collections::HashMap::<String, DownloadState>::new()));
             // Initialize Playback Manager State (for HLS ffmpeg processes)
             app.manage(std::sync::Mutex::new(std::collections::HashMap::<String, PlaybackState>::new()));
+            
+            // Initialize Stream Proxy for video playback
+            let stream_proxy = Arc::new(stream_proxy::StreamProxy::new(9876));
+            app.manage(stream_proxy.clone());
+            
+            // Initialize URL Cache for quality switching
+            let url_cache = url_cache::UrlCache::new();
+            app.manage(url_cache);
+            
+            // Start proxy server in background
+            tauri::async_runtime::spawn(async move {
+                stream_proxy::start_proxy_server(stream_proxy).await;
+            });
 
             #[cfg(target_os = "windows")]
             {
@@ -1826,7 +2400,22 @@ pub fn run() {
             set_download_dir, 
             cancel_download, 
             delete_file, 
-            reveal_file_in_explorer
+            reveal_file_in_explorer,
+            search::search_videos,
+            playlist::get_playlist_metadata,
+            playlist::get_video_formats,
+            get_streaming_url,
+            get_all_streaming_urls,
+            set_stream_url,
+            start_streaming,
+            fetch_remaining_qualities,
+            switch_quality,
+            stream_video,
+            fetch_all_qualities,
+            update_ytdlp,
+            check_app_update,
+            download_app_update,
+            install_app_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

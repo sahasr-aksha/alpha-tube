@@ -4,6 +4,7 @@ import { downloadDir } from "@tauri-apps/api/path";
 import CyberPlayer from "./CyberPlayer";
 import PlaylistCard, { PlaylistFolder, VideoFile } from "./PlaylistCard";
 import { DownloadProgress } from "./App";
+import { Search, ArrowUpDown, X } from "lucide-react";
 import "./Downloads.css";
 
 interface LibraryContent {
@@ -28,6 +29,11 @@ function Downloads({ onBack: _onBack, activeDownloads = {}, onPause, onResume, c
     const [library, setLibrary] = useState<LibraryContent>({ playlists: [], singles: [] });
     const [loading, setLoading] = useState(true);
     const [selectedVideo, setSelectedVideo] = useState<VideoFile | null>(null);
+
+    // Search and sort state
+    const [searchFilter, setSearchFilter] = useState("");
+    const [sortBy, setSortBy] = useState<"date" | "name" | "size">("date");
+    const [sortMenuOpen, setSortMenuOpen] = useState(false);
 
     const activeDownloadsList = Object.values(activeDownloads);
     const hasDownloads = activeDownloadsList.length > 0;
@@ -60,6 +66,28 @@ function Downloads({ onBack: _onBack, activeDownloads = {}, onPause, onResume, c
     };
 
     const totalVideos = library.playlists.reduce((sum, p) => sum + p.video_count, 0) + library.singles.length;
+
+    // Filter and sort videos
+    const filteredSingles = library.singles
+        .filter(video =>
+            !searchFilter || video.name.toLowerCase().includes(searchFilter.toLowerCase())
+        )
+        .sort((a, b) => {
+            switch (sortBy) {
+                case "name":
+                    return a.name.localeCompare(b.name);
+                case "size":
+                    return b.size - a.size;
+                case "date":
+                default:
+                    return b.modified_date.localeCompare(a.modified_date);
+            }
+        });
+
+    const filteredPlaylists = library.playlists
+        .filter(playlist =>
+            !searchFilter || playlist.name.toLowerCase().includes(searchFilter.toLowerCase())
+        );
 
     const handleCancel = async (id: string) => {
         try {
@@ -140,6 +168,56 @@ function Downloads({ onBack: _onBack, activeDownloads = {}, onPause, onResume, c
                 </div>
             </div>
 
+            {/* Search and Sort Bar */}
+            <div className="flex gap-4 mb-6">
+                <div className="flex-1 relative">
+                    <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+                    <input
+                        type="text"
+                        value={searchFilter}
+                        onChange={(e) => setSearchFilter(e.target.value)}
+                        placeholder="Search library..."
+                        className="w-full pl-10 pr-10 py-2 rounded-lg bg-[#2D2D30] text-white placeholder-gray-500 border border-white/10 focus:outline-none focus:border-neo-mint/50 transition-all"
+                    />
+                    {searchFilter && (
+                        <button
+                            onClick={() => setSearchFilter("")}
+                            className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white"
+                        >
+                            <X size={16} />
+                        </button>
+                    )}
+                </div>
+                <div className="relative">
+                    <button
+                        onClick={() => setSortMenuOpen(!sortMenuOpen)}
+                        className="flex items-center gap-2 px-4 py-2 rounded-lg bg-[#2D2D30] text-white border border-white/10 hover:border-neo-mint/50 transition-all"
+                    >
+                        <ArrowUpDown size={16} />
+                        <span className="text-sm">Sort: {sortBy.charAt(0).toUpperCase() + sortBy.slice(1)}</span>
+                    </button>
+                    {sortMenuOpen && (
+                        <div className="absolute top-full right-0 mt-2 bg-[#1E1E24] border border-white/10 rounded-lg shadow-xl z-50 overflow-hidden">
+                            {(["date", "name", "size"] as const).map((option) => (
+                                <button
+                                    key={option}
+                                    onClick={() => {
+                                        setSortBy(option);
+                                        setSortMenuOpen(false);
+                                    }}
+                                    className={`w-full px-4 py-2 text-left text-sm transition-colors ${sortBy === option
+                                        ? "bg-neo-mint/20 text-neo-mint"
+                                        : "text-white/80 hover:bg-white/5"
+                                        }`}
+                                >
+                                    {option.charAt(0).toUpperCase() + option.slice(1)}
+                                </button>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            </div>
+
             {/* Active Download Queue */}
             {hasDownloads && (
                 <div className="mb-12">
@@ -214,9 +292,10 @@ function Downloads({ onBack: _onBack, activeDownloads = {}, onPause, onResume, c
                                                     <span className={`text-xs font-bold px-2 py-1 rounded ${progress.status === 'paused' ? 'bg-yellow-500/20 text-yellow-400' :
                                                         progress.status === 'complete' ? 'bg-green-500/20 text-green-400' :
                                                             progress.status === 'error' ? 'bg-red-500/20 text-red-400' :
-                                                                'bg-neo-mint/20 text-neo-mint'
+                                                                progress.status === 'muxing' ? 'bg-purple-500/20 text-purple-400' :
+                                                                    'bg-neo-mint/20 text-neo-mint'
                                                         }`}>
-                                                        {progress.status.toUpperCase()}
+                                                        {progress.status === 'muxing' ? 'MUXING' : progress.status.toUpperCase()}
                                                     </span>
 
                                                     {/* Pause/Resume Controls */}
@@ -265,20 +344,35 @@ function Downloads({ onBack: _onBack, activeDownloads = {}, onPause, onResume, c
                                                     <div
                                                         className={`h-full transition-all duration-300 ease-out ${progress.status === 'paused' ? 'bg-yellow-500' :
                                                             progress.status === 'complete' ? 'bg-green-500' :
-                                                                'bg-neo-mint shadow-[0_0_10px_rgba(0,255,163,0.5)]'
+                                                                progress.status === 'error' ? 'bg-red-500' :
+                                                                    progress.status === 'muxing' ? 'bg-purple-500 shadow-[0_0_10px_rgba(168,85,247,0.5)]' :
+                                                                        'bg-neo-mint shadow-[0_0_10px_rgba(0,255,163,0.5)]'
                                                             }`}
-                                                        style={{ width: `${progress.percent}%` }}
+                                                        style={{ width: `${progress.status === 'error' ? 100 : progress.percent}%` }}
                                                     />
                                                 </div>
 
-                                                {/* Stats Row */}
-                                                <div className="flex justify-between items-center mt-2 text-xs font-mono">
-                                                    <div className="flex items-center gap-4 text-gray-500">
-                                                        <span><span className="text-neo-mint">{progress.percent.toFixed(1)}%</span></span>
-                                                        <span>↓ {progress.speed || "0 B/s"}</span>
+                                                {/* Stats Row - Show error message OR progress stats */}
+                                                {progress.status === 'error' ? (
+                                                    <div className="flex items-center gap-2 mt-2 text-xs text-red-400">
+                                                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                                            <circle cx="12" cy="12" r="10"></circle>
+                                                            <line x1="12" y1="8" x2="12" y2="12"></line>
+                                                            <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                                                        </svg>
+                                                        <span className="flex-1 truncate" title={progress.error_message || "Unknown error"}>
+                                                            {progress.error_message || "Download failed. Please try again."}
+                                                        </span>
                                                     </div>
-                                                    <span className="text-gray-500">ETA: {progress.eta || "--:--"}</span>
-                                                </div>
+                                                ) : (
+                                                    <div className="flex justify-between items-center mt-2 text-xs font-mono">
+                                                        <div className="flex items-center gap-4 text-gray-500">
+                                                            <span><span className="text-neo-mint">{progress.percent.toFixed(1)}%</span></span>
+                                                            <span>↓ {progress.speed || "0 B/s"}</span>
+                                                        </div>
+                                                        <span className="text-gray-500">ETA: {progress.eta || "--:--"}</span>
+                                                    </div>
+                                                )}
                                             </div>
                                         </div>
                                     </div>
@@ -300,13 +394,14 @@ function Downloads({ onBack: _onBack, activeDownloads = {}, onPause, onResume, c
             ) : (
                 <div className="space-y-10 pb-6">
                     {/* Playlists Section */}
-                    {library.playlists.length > 0 && (
+                    {filteredPlaylists.length > 0 && (
                         <section>
                             <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
                                 <span className="text-electric-lavender">▶</span> PLAYLISTS
+                                {searchFilter && <span className="text-xs text-gray-500 font-normal">({filteredPlaylists.length} matching)</span>}
                             </h2>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                                {library.playlists.map((playlist) => (
+                                {filteredPlaylists.map((playlist) => (
                                     <PlaylistCard
                                         key={playlist.path}
                                         playlist={playlist}
@@ -320,13 +415,14 @@ function Downloads({ onBack: _onBack, activeDownloads = {}, onPause, onResume, c
                     )}
 
                     {/* Singles Section */}
-                    {library.singles.length > 0 && (
+                    {filteredSingles.length > 0 && (
                         <section>
                             <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
                                 <span className="text-neo-mint">◆</span> VIDEOS
+                                {searchFilter && <span className="text-xs text-gray-500 font-normal">({filteredSingles.length} matching)</span>}
                             </h2>
                             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-                                {library.singles.map((video) => (
+                                {filteredSingles.map((video) => (
                                     <div
                                         key={video.path}
                                         onClick={() => setSelectedVideo(video)}

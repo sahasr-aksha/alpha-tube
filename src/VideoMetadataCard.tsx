@@ -10,6 +10,7 @@ export interface VideoFormat {
     vcodec: string;
     acodec: string;
     note: string;
+    tbr: number;  // Total bitrate in kbps
 }
 
 export interface VideoMetadataResponse {
@@ -58,14 +59,77 @@ const VideoMetadataCard: React.FC<VideoMetadataCardProps> = ({ metadata, formats
         // Check string includes first for common formats
         if (res.includes('2160') || (dimKey >= 2160)) return "4K Ultra HD";
         if (res.includes('1440') || (dimKey >= 1440)) return "2K QHD";
-        if (res.includes('1080') || (dimKey >= 1080)) return "Full HD";
+        if (res.includes('1080') || (dimKey >= 1080)) return "FHD";
         if (res.includes('720') || (dimKey >= 720)) return "HD";
-        if (res.includes('480') || (dimKey >= 480)) return "Standard (480p)";
+        if (res.includes('480') || (dimKey >= 480)) return "Medium";
         if (res.includes('360') || (dimKey >= 360)) return "Low";
         if (res.includes('240') || res.includes('244') || (dimKey >= 240)) return "Very Low";
-        if (res.includes('144') || (dimKey >= 144) || (dimKey > 0 && dimKey < 144)) return "Xtream Low";
+        if (res.includes('144') || (dimKey >= 144) || (dimKey > 0 && dimKey < 144)) return "Dirt Low";
 
         return res || "Unknown";
+    };
+
+    const getResolutionLabel = (fmt: VideoFormat) => {
+        // Audio Check
+        if (fmt.vcodec === 'none' || fmt.resolution === 'audio only') {
+            return fmt.ext.toUpperCase();
+        }
+
+        const res = fmt.resolution || "";
+        const dimKey = Math.min(parseInt(res.split('x')[0] || "0"), parseInt(res.split('x')[1] || "0"));
+
+        // Return resolution in user-friendly format
+        if (res.includes('2160') || (dimKey >= 2160)) return "2160p";
+        if (res.includes('1440') || (dimKey >= 1440)) return "1440p";
+        if (res.includes('1080') || (dimKey >= 1080)) return "1080p";
+        if (res.includes('720') || (dimKey >= 720)) return "720p";
+        if (res.includes('480') || (dimKey >= 480)) return "480p";
+        if (res.includes('360') || (dimKey >= 360)) return "360p";
+        if (res.includes('240') || res.includes('244') || (dimKey >= 240)) return "240p";
+        if (res.includes('144') || (dimKey >= 144) || (dimKey > 0 && dimKey < 144)) return "144p";
+
+        return res || "N/A";
+    };
+
+    // Get user-friendly codec name
+    const getCodecLabel = (fmt: VideoFormat): string => {
+        const vcodec = fmt.vcodec.toLowerCase();
+        if (vcodec === 'none' || fmt.resolution === 'audio only') {
+            // Audio codec
+            const acodec = fmt.acodec.toLowerCase();
+            if (acodec.includes('mp4a') || acodec.includes('aac')) return 'AAC';
+            if (acodec.includes('opus')) return 'Opus';
+            if (acodec.includes('mp3')) return 'MP3';
+            if (acodec.includes('vorbis')) return 'Vorbis';
+            return fmt.acodec.toUpperCase();
+        }
+        // Video codec
+        if (vcodec.includes('avc') || vcodec.includes('h264')) return 'H.264';
+        if (vcodec.includes('hevc') || vcodec.includes('hev') || vcodec.includes('hvc')) return 'HEVC';
+        if (vcodec.includes('vp9') || vcodec.includes('vp09')) return 'VP9';
+        if (vcodec.includes('vp8')) return 'VP8';
+        if (vcodec.includes('av01') || vcodec.includes('av1')) return 'AV1';
+        return vcodec.split('.')[0].toUpperCase();
+    };
+
+    // Get bitrate quality label (Best/Good/Worst) by comparing with other formats at same resolution
+    const getBitrateQualityLabel = (fmt: VideoFormat, allFormats: VideoFormat[]): string => {
+        if (fmt.tbr === 0) return '';
+
+        // Find formats with same resolution
+        const sameResFormats = allFormats.filter(f => f.resolution === fmt.resolution && f.tbr > 0);
+        if (sameResFormats.length <= 1) return '';
+
+        // Sort by bitrate descending
+        const sortedBitrates = sameResFormats.map(f => f.tbr).sort((a, b) => b - a);
+        const maxBitrate = sortedBitrates[0];
+        const minBitrate = sortedBitrates[sortedBitrates.length - 1];
+
+        if (maxBitrate === minBitrate) return '';
+
+        if (fmt.tbr === maxBitrate) return 'Best';
+        if (fmt.tbr === minBitrate) return 'Medium';
+        return 'Good';
     };
 
     return (
@@ -159,12 +223,25 @@ const VideoMetadataCard: React.FC<VideoMetadataCardProps> = ({ metadata, formats
                             <button
                                 key={fmt.format_id}
                                 onClick={() => onDownload(fmt.format_id)}
-                                className="group relative overflow-hidden rounded-xl border border-neo-mint/30 bg-card-darker hover:bg-neo-mint transition-all duration-300 p-3 text-left shadow-sm hover:shadow-neon-mint"
+                                className="group relative overflow-hidden rounded-xl border border-neo-mint/30 bg-card-darker hover:bg-neo-mint hover:scale-105 hover:-translate-y-1 transition-all duration-300 p-3 text-left shadow-sm hover:shadow-neon-mint"
                             >
                                 <div className="relative z-10 flex flex-col items-center justify-center text-center gap-1">
                                     <span className="text-lg font-black text-white group-hover:text-black transition-colors">
                                         {getQualityLabel(fmt)}
                                     </span>
+                                    <span className="text-sm font-bold text-neo-mint group-hover:text-black/80 transition-colors">
+                                        {getResolutionLabel(fmt)} • {getCodecLabel(fmt)}
+                                    </span>
+                                    {getBitrateQualityLabel(fmt, formats) && (
+                                        <span className={`text-xs font-bold px-2 py-0.5 rounded-full transition-colors ${getBitrateQualityLabel(fmt, formats) === 'Best'
+                                            ? 'bg-green-500/20 text-green-400 group-hover:bg-green-500/40 group-hover:text-green-900'
+                                            : getBitrateQualityLabel(fmt, formats) === 'Medium'
+                                                ? 'bg-orange-500/20 text-orange-400 group-hover:bg-orange-500/40 group-hover:text-orange-900'
+                                                : 'bg-yellow-500/20 text-yellow-400 group-hover:bg-yellow-500/40 group-hover:text-yellow-900'
+                                            }`}>
+                                            {getBitrateQualityLabel(fmt, formats)} Quality
+                                        </span>
+                                    )}
                                     <span className="text-xs font-mono text-text-muted group-hover:text-black/70 transition-colors">
                                         {fmt.ext.toUpperCase()} • {formatBytes(fmt.filesize)}
                                     </span>

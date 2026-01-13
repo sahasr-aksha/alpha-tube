@@ -1,0 +1,12 @@
+﻿
+> alpha-tube@0.1.5 tauri
+> tauri signer sign -f src-tauri/alpha-tube.key -p Zoronoato@1 src-tauri/target/release/bundle/nsis/Alpha Tube_0.1.5_x64-setup.exe
+
+
+Your file was signed successfully, You can find the signature here:
+D:\Alpha Tube\src-tauri\target\release\bundle\nsis\Alpha Tube_0.1.5_x64-setup.exe.sig
+
+Public signature:
+dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUa3lHVndEYVhINWNnREl0bDhXZmxQb2dvTHhLcTd6d2tGS0owZHF3K0dsb3d6Ti9ZVFR3aDhPd3NjcWJtekEzYkd6NWpwNXRjVVlud2tnZzdseURMVWlncHpiR05oS1FBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzY4Mjg1NjA5CWZpbGU6QWxwaGEgVHViZV8wLjEuNV94NjQtc2V0dXAuZXhlCmVhQ1dReXJtcVU3L0NOL084TCtVc1QwMDRvaFcwVTdkZEZ4VUd4cGZCSCt2MVhIMjNydjV5UkswU1JDWDRlNkdSR2xoM2k2QXdKVUtPR1RIbXBWR0F3PT0K
+
+Make sure to include this into the signature field of your update server.

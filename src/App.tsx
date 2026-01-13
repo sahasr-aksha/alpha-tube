@@ -1,20 +1,28 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import VideoMetadataCard, { VideoMetadataResponse, VideoFormat } from "./VideoMetadataCard";
+import PlaylistMetadataCard, { PlaylistMetadataResponse, SelectedVideo } from "./PlaylistMetadataCard";
 import { listen } from "@tauri-apps/api/event";
 import { downloadDir } from "@tauri-apps/api/path";
 import { motion, AnimatePresence } from "framer-motion";
 import { sendNotification } from "@tauri-apps/plugin-notification";
 import { open } from "@tauri-apps/plugin-dialog";
 import Downloads from "./Downloads";
+import Settings from "./Settings";
 import AboutUs from "./AboutUs";
-import YouTubeBrowser from "./YouTubeBrowser";
-import { Terminal, Library, Globe, Info, Menu, ChevronLeft } from "lucide-react";
+
+import SearchResultCard, { VideoSearchResult } from "./SearchResultCard";
+import { SkeletonGrid, FormatSkeletonGrid } from "./SkeletonCard";
+import { reRankSearchResults } from "./searchUtils";
+import PlatformSelector, { PLATFORMS } from "./PlatformSelector";
+import { Search, Library, Info, Menu, ChevronLeft, Settings as SettingsIcon, X, Clock } from "lucide-react";
 import "./App.css";
 import Toast from "./Toast";
+import ActionDialog from "./ActionDialog";
+import StreamPlayer from "./StreamPlayer";
 import UpdateNotification from "./UpdateNotification";
+import LegalDisclaimer from "./LegalDisclaimer";
 import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 
 // Export this interface so it can be used in Downloads.tsx
 export interface DownloadProgress {
@@ -28,13 +36,52 @@ export interface DownloadProgress {
   title?: string;
   thumbnail?: string;
   duration?: number;
+  // User-friendly error message when status is "error"
+  error_message?: string;
 }
 
 export interface AppConfig {
   download_dir: string | null;
 }
 
+/**
+ * Convert technical error messages to user-friendly text with actionable suggestions
+ */
+function getUserFriendlyError(error: string): string {
+  const errorLower = error.toLowerCase();
+
+  if (errorLower.includes('network') || errorLower.includes('fetch') || errorLower.includes('connection')) {
+    return "Unable to connect. Please check your internet connection and try again.";
+  }
+  if (errorLower.includes('not found') || errorLower.includes('404')) {
+    return "Video not found. The link may be broken or the video was removed.";
+  }
+  if (errorLower.includes('private') || errorLower.includes('unavailable')) {
+    return "This video is private or unavailable in your region.";
+  }
+  if (errorLower.includes('age') || errorLower.includes('sign in')) {
+    return "This video requires age verification or sign-in, which is not supported.";
+  }
+  if (errorLower.includes('rate limit') || errorLower.includes('too many')) {
+    return "Too many requests. Please wait a moment and try again.";
+  }
+  if (errorLower.includes('format') || errorLower.includes('no video')) {
+    return "No downloadable formats found for this video.";
+  }
+  if (errorLower.includes('timeout')) {
+    return "Request timed out. The server may be slow - try again later.";
+  }
+
+  // Default fallback with original error for debugging
+  return `Something went wrong: ${error.slice(0, 100)}`;
+}
+
 function App() {
+  // Legal disclaimer state - check if user has accepted terms
+  const [termsAccepted, setTermsAccepted] = useState(() => {
+    return localStorage.getItem("termsAccepted") === "true";
+  });
+
   const [url, setUrl] = useState("");
   // Replaced single downloading boolean with derived state from activeDownloads keys
   const [activeDownloads, setActiveDownloads] = useState<Record<string, DownloadProgress>>({});
@@ -44,7 +91,42 @@ function App() {
   const [activeTab, setActiveTab] = useState("home"); // home, downloads, browse, about
   const [formats, setFormats] = useState<VideoFormat[]>([]);
   const [videoMetadata, setVideoMetadata] = useState<VideoMetadataResponse | null>(null);
+  const [playlistMetadata, setPlaylistMetadata] = useState<PlaylistMetadataResponse | null>(null);
   const [loadingFormats, setLoadingFormats] = useState(false);
+
+  // Search results state
+  const [searchResults, setSearchResults] = useState<VideoSearchResult[]>([]);
+  const [selectedPlatform, setSelectedPlatform] = useState("ytsearch");
+  const [searchLoading, setSearchLoading] = useState(false);
+  // Pagination state for dynamic loading
+  const [searchPage, setSearchPage] = useState(1);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [hasMoreResults, setHasMoreResults] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Exclude YouTube Shorts from search results (default: enabled)
+  const [excludeShorts, setExcludeShorts] = useState(true);
+  const MIN_DISPLAY_RESULTS = 8; // Minimum results to show before considering "enough"
+
+  // Search history state
+  const [searchHistory, setSearchHistory] = useState<string[]>(() => {
+    const saved = localStorage.getItem("searchHistory");
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [showSearchHistory, setShowSearchHistory] = useState(false);
+
+  // Save search to history
+  const addToSearchHistory = (query: string) => {
+    if (!query.trim() || query.startsWith('http')) return; // Don't save URLs
+    const updated = [query, ...searchHistory.filter(h => h !== query)].slice(0, 10);
+    setSearchHistory(updated);
+    localStorage.setItem("searchHistory", JSON.stringify(updated));
+  };
+
+  // Clear search history
+  const clearSearchHistory = () => {
+    setSearchHistory([]);
+    localStorage.removeItem("searchHistory");
+  };
 
   // App Config
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -62,6 +144,11 @@ function App() {
   // Auto-Update state
   const [updateReady, setUpdateReady] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<{ version: string; body?: string } | null>(null);
+
+  // Action Dialog & Stream Player state
+  const [actionDialogVisible, setActionDialogVisible] = useState(false);
+  const [streamPlayerVisible, setStreamPlayerVisible] = useState(false);
+  const [pendingVideo, setPendingVideo] = useState<{ url: string; title: string; thumbnail: string } | null>(null);
 
   // Load Config
   useEffect(() => {
@@ -135,14 +222,14 @@ function App() {
           console.error(e);
         }
 
-        // Cleanup finished download from list after 5s
+        // Cleanup finished download from list after 30s (improved visibility)
         setTimeout(() => {
           setActiveDownloads(prev => {
             const copy = { ...prev };
             delete copy[id];
             return copy;
           });
-        }, 5000);
+        }, 30000);
 
       } else if (status === "error") {
         setStatusMessage(`Error: ${filename}`);
@@ -223,11 +310,14 @@ function App() {
       const update = await check();
       if (update) {
         await update.downloadAndInstall();
-        await relaunch();
+        // Note: On Windows NSIS, the installer handles relaunch automatically
+        // Do not call relaunch() here as it may interfere with the installer
       }
     } catch (error) {
       console.error("[Update] Failed to install:", error);
       setStatusMessage(`Update failed: ${error}`);
+      setToastMessage("Update failed. Try manual update in Settings.");
+      setShowToast(true);
     }
   };
 
@@ -257,32 +347,217 @@ function App() {
     return () => clearInterval(interval);
   }, [loadingFormats]);
 
-  const handleFetchFormats = async () => {
+  // Helper to detect if input is a URL
+  const isUrl = (input: string): boolean => {
+    const trimmed = input.trim();
+    return trimmed.includes("://") ||
+      trimmed.startsWith("www.") ||
+      trimmed.includes("youtube.com") ||
+      trimmed.includes("youtu.be");
+  };
+
+  const handleSearch = async () => {
     if (!url) {
-      setStatusMessage("Please enter a URL first.");
+      setStatusMessage("Please enter a URL or search query.");
       return;
     }
 
-    setLoadingFormats(true);
-    setStatusMessage("Fetching video formats...");
+    // Clear previous results
     setFormats([]);
+    setVideoMetadata(null);
+    setPlaylistMetadata(null);
+    setSearchResults([]);
+
+    if (isUrl(url)) {
+      // URL mode - fetch video metadata (existing behavior)
+      setLoadingFormats(true);
+      setStatusMessage("Fetching video formats...");
+
+      try {
+        const result = await invoke<VideoMetadataResponse>("get_video_metadata", { url });
+
+        setVideoMetadata(result);
+
+        // Sort: 4K/High res first
+        if (!result.is_playlist) {
+          setPlaylistMetadata(null);
+          const sorted = result.formats.sort((a, b) => {
+            return b.filesize - a.filesize;
+          });
+          setFormats(sorted);
+          setStatusMessage(`Found ${result.formats.length} formats for "${result.title}"`);
+        } else {
+          // PLAYLIST DETECTED - fetch full playlist metadata
+          setVideoMetadata(null);
+          setFormats([]);
+          setStatusMessage(`Playlist detected: "${result.title}" - Fetching video list...`);
+
+          try {
+            const playlistData = await invoke<PlaylistMetadataResponse>("get_playlist_metadata", { url });
+            setPlaylistMetadata(playlistData);
+            setStatusMessage(`Playlist "${playlistData.title}" - ${playlistData.videos.length} videos ready`);
+          } catch (playlistError) {
+            console.error("Failed to fetch playlist details:", playlistError);
+            setStatusMessage(`Playlist found but couldn't load details: ${playlistError}`);
+          }
+        }
+      } catch (error) {
+        console.error(error);
+        setStatusMessage(getUserFriendlyError(String(error)));
+      } finally {
+        setLoadingFormats(false);
+      }
+    } else {
+      // Text search mode - search using selected platform
+      const platformName = PLATFORMS.find(p => p.id === selectedPlatform)?.name || "YouTube";
+      setSearchLoading(true);
+      setStatusMessage(`Searching ${platformName}...`);
+      setSearchQuery(url); // Store query for Load More
+      setSearchPage(1);
+      addToSearchHistory(url); // Save to search history
+
+      try {
+        // Fetch larger initial pool for better filtering
+        let allResults: VideoSearchResult[] = [];
+        let currentPage = 1;
+        const PAGE_SIZE = 25;
+        const MAX_PAGES = 4; // Max pages to auto-fetch
+
+        // Keep fetching until we have enough filtered results or hit max
+        while (currentPage <= MAX_PAGES) {
+          const results = await invoke<VideoSearchResult[]>("search_videos", {
+            query: url,
+            platform: selectedPlatform,
+            page: currentPage,
+            pageSize: PAGE_SIZE,
+            excludeShorts: selectedPlatform === "ytsearch" && excludeShorts,
+          });
+
+          if (results.length === 0) {
+            // No more results from backend
+            setHasMoreResults(false);
+            break;
+          }
+
+          allResults = [...allResults, ...results];
+
+          // Apply fuzzy re-ranking: filter by 90% similarity threshold, sort by view count
+          const rankedResults = reRankSearchResults(allResults, url, 0.9);
+
+          if (rankedResults.length >= MIN_DISPLAY_RESULTS || currentPage >= MAX_PAGES) {
+            setSearchResults(rankedResults);
+            setSearchPage(currentPage);
+            setHasMoreResults(results.length === PAGE_SIZE); // More available if we got full page
+            setStatusMessage(
+              `Found ${allResults.length} results on ${platformName}, showing ${rankedResults.length} relevant matches`
+            );
+            break;
+          }
+
+          // Not enough filtered results, fetch next page
+          setStatusMessage(`Searching for more relevant results... (page ${currentPage + 1})`);
+          currentPage++;
+        }
+
+        if (allResults.length === 0) {
+          setStatusMessage(`No results found for "${url}"`);
+          setHasMoreResults(false);
+        }
+      } catch (error) {
+        console.error(error);
+        setStatusMessage(getUserFriendlyError(String(error)));
+      } finally {
+        setSearchLoading(false);
+      }
+    }
+  };
+
+  // Load more search results
+  const handleLoadMore = async () => {
+    if (!searchQuery || loadingMore) return;
+
+    const platformName = PLATFORMS.find(p => p.id === selectedPlatform)?.name || "YouTube";
+    setLoadingMore(true);
+    const nextPage = searchPage + 1;
 
     try {
-      const result = await invoke<VideoMetadataResponse>("get_video_metadata", { url });
+      const results = await invoke<VideoSearchResult[]>("search_videos", {
+        query: searchQuery,
+        platform: selectedPlatform,
+        page: nextPage,
+        pageSize: 25,
+        excludeShorts: selectedPlatform === "ytsearch" && excludeShorts,
+      });
 
+      if (results.length === 0) {
+        setHasMoreResults(false);
+        setStatusMessage("No more results available");
+        return;
+      }
+
+      // Filter new results and add to existing
+      const newFiltered = reRankSearchResults(results, searchQuery, 0.9);
+
+      // Merge with existing results (avoid duplicates by video_url)
+      const existingUrls = new Set(searchResults.map(r => r.video_url));
+      const uniqueNew = newFiltered.filter(r => !existingUrls.has(r.video_url));
+
+      // Re-sort combined results by view count
+      const combined = [...searchResults, ...uniqueNew].sort((a, b) =>
+        (b.view_count ?? 0) - (a.view_count ?? 0)
+      );
+
+      setSearchResults(combined);
+      setSearchPage(nextPage);
+      setHasMoreResults(results.length === 25);
+      setStatusMessage(
+        `Showing ${combined.length} relevant matches from ${platformName}`
+      );
+    } catch (error) {
+      console.error(error);
+      setStatusMessage(`Failed to load more: ${error}`);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  // Handler when user clicks a search result - show action dialog
+  const handleSearchResultClick = async (videoUrl: string, title?: string, thumbnail?: string | null) => {
+    setPendingVideo({
+      url: videoUrl,
+      title: title || "Video",
+      thumbnail: thumbnail || ""
+    });
+    setActionDialogVisible(true);
+  };
+
+  // Handle Play choice from action dialog
+  const handlePlayChoice = () => {
+    setActionDialogVisible(false);
+    setStreamPlayerVisible(true);
+  };
+
+  // Handle Download choice from action dialog
+  const handleDownloadChoice = async () => {
+    if (!pendingVideo) return;
+
+    setActionDialogVisible(false);
+    setUrl(pendingVideo.url);
+    setSearchResults([]);
+    setLoadingFormats(true);
+    setStatusMessage("Fetching video metadata...");
+
+    try {
+      const result = await invoke<VideoMetadataResponse>("get_video_metadata", { url: pendingVideo.url });
       setVideoMetadata(result);
 
-      // Sort: 4K/High res first
       if (!result.is_playlist) {
-        const sorted = result.formats.sort((a, b) => {
-          // Simple heuristic: higher filesize usually means better quality
-          return b.filesize - a.filesize;
-        });
+        const sorted = result.formats.sort((a, b) => b.filesize - a.filesize);
         setFormats(sorted);
         setStatusMessage(`Found ${result.formats.length} formats for "${result.title}"`);
       } else {
         setFormats([]);
-        setStatusMessage(`Playlist found: "${result.title}" (${result.video_count} videos)`);
+        setStatusMessage(`Playlist detected: ${result.title}`);
       }
     } catch (error) {
       console.error(error);
@@ -291,6 +566,94 @@ function App() {
       setLoadingFormats(false);
     }
   };
+
+  // Handle switching from stream player to download
+  const handleStreamToDownload = async () => {
+    if (!pendingVideo) return;
+
+    setStreamPlayerVisible(false);
+    setUrl(pendingVideo.url);
+    setSearchResults([]);
+    setLoadingFormats(true);
+    setStatusMessage("Preparing download options...");
+
+    try {
+      const result = await invoke<VideoMetadataResponse>("get_video_metadata", { url: pendingVideo.url });
+      setVideoMetadata(result);
+
+      if (!result.is_playlist) {
+        const sorted = result.formats.sort((a, b) => b.filesize - a.filesize);
+        setFormats(sorted);
+        setStatusMessage(`Found ${result.formats.length} formats for "${result.title}"`);
+      } else {
+        setFormats([]);
+        setStatusMessage(`Playlist detected: ${result.title}`);
+      }
+    } catch (error) {
+      console.error(error);
+      setStatusMessage(`Failed to fetch formats: ${error}`);
+    } finally {
+      setLoadingFormats(false);
+    }
+  };
+
+  // Handler for playlist batch download
+  const handlePlaylistDownload = async (selectedVideos: SelectedVideo[]) => {
+    if (!playlistMetadata || selectedVideos.length === 0) return;
+
+    setToastMessage(`Starting ${selectedVideos.length} downloads from playlist...`);
+    setShowToast(true);
+    setStatusMessage(`Queueing ${selectedVideos.length} videos from "${playlistMetadata.title}"...`);
+
+    const output_path = await downloadDir();
+
+    // Queue each selected video as individual download
+    for (const video of selectedVideos) {
+      const downloadId = Date.now().toString() + Math.random().toString(36).substring(2, 9);
+
+      // Add to active downloads with playlist context
+      setActiveDownloads(prev => ({
+        ...prev,
+        [downloadId]: {
+          id: downloadId,
+          percent: 0,
+          speed: "0 MB/s",
+          eta: "--:--",
+          status: "queued",
+          filename: `[${video.index}/${selectedVideos.length}] ${video.title}`,
+          title: video.title,
+          thumbnail: video.thumbnail,
+          duration: video.duration,
+          // Playlist context (will be used for grouping in Downloads.tsx later)
+        }
+      }));
+
+      // Start the download
+      try {
+        await invoke("download_video", {
+          options: {
+            id: downloadId,
+            url: video.url,
+            quality: video.quality,
+            output_path,
+            format_id: video.formatId
+          },
+        });
+        console.log("Playlist video download started:", downloadId, video.title);
+      } catch (error) {
+        console.error("Failed to start download for:", video.title, error);
+        // Remove failed download from state
+        setActiveDownloads(prev => {
+          const copy = { ...prev };
+          delete copy[downloadId];
+          return copy;
+        });
+      }
+    }
+
+    setStatusMessage(`Downloads started for ${selectedVideos.length} videos`);
+  };
+
 
   const handleDownload = async (formatId: string | null = null, qualityPreset: string = "best") => {
     if (!url) return;
@@ -361,34 +724,7 @@ function App() {
     localStorage.setItem("sidebarCollapsed", JSON.stringify(newState));
   };
 
-  // Handle video detected from YouTubeBrowser - switch to home tab with URL
-  const handleVideoDetected = async (detectedUrl: string) => {
-    setUrl(detectedUrl);
-    setActiveTab("home");
 
-    // Auto-fetch metadata
-    setLoadingFormats(true);
-    setStatusMessage("Video Detected: Fetching metadata...");
-
-    try {
-      const result = await invoke<VideoMetadataResponse>("get_video_metadata", { url: detectedUrl });
-      setVideoMetadata(result);
-
-      if (!result.is_playlist) {
-        const sorted = result.formats.sort((a, b) => b.filesize - a.filesize);
-        setFormats(sorted);
-        setStatusMessage(`Found ${result.formats.length} formats for "${result.title}"`);
-      } else {
-        setFormats([]);
-        setStatusMessage(`Playlist detected: ${result.title}`);
-      }
-    } catch (error) {
-      console.error(error);
-      setStatusMessage(`Failed to fetch formats: ${error}`);
-    } finally {
-      setLoadingFormats(false);
-    }
-  };
 
 
 
@@ -445,6 +781,11 @@ function App() {
     }
   };
 
+  // Show legal disclaimer on first launch
+  if (!termsAccepted) {
+    return <LegalDisclaimer onAccept={() => setTermsAccepted(true)} />;
+  }
+
   return (
     <div className="h-screen flex flex-row relative overflow-hidden font-sans text-gray-100 app-glass-container">
 
@@ -477,10 +818,12 @@ function App() {
               ? "bg-[#37373D] text-white shadow-sm border-l-2 border-neo-mint"
               : "text-gray-400 hover:bg-[#2D2D30] hover:text-white"
               }`}
-            title="Terminal"
+            title="Search"
+            aria-label="Search for videos"
+            aria-current={activeTab === "home" ? "page" : undefined}
           >
-            <Terminal size={18} />
-            {!sidebarCollapsed && <span>Terminal</span>}
+            <Search size={18} />
+            {!sidebarCollapsed && <span>Search</span>}
           </button>
 
           <button
@@ -490,22 +833,14 @@ function App() {
               : "text-gray-400 hover:bg-[#2D2D30] hover:text-white"
               }`}
             title="Library"
+            aria-label="View download library"
+            aria-current={activeTab === "downloads" ? "page" : undefined}
           >
             <Library size={18} />
             {!sidebarCollapsed && <span>Library</span>}
           </button>
 
-          <button
-            onClick={() => setActiveTab("browse")}
-            className={`p-2 rounded-md transition-all duration-150 text-sm font-medium flex items-center gap-3 ${activeTab === "browse"
-              ? "bg-[#37373D] text-white shadow-sm border-l-2 border-red-500"
-              : "text-gray-400 hover:bg-[#2D2D30] hover:text-white"
-              }`}
-            title="Browse YouTube"
-          >
-            <Globe size={18} />
-            {!sidebarCollapsed && <span>Browse</span>}
-          </button>
+
 
           <button
             onClick={() => setActiveTab("about")}
@@ -514,9 +849,25 @@ function App() {
               : "text-gray-400 hover:bg-[#2D2D30] hover:text-white"
               }`}
             title="About"
+            aria-label="About Alpha Tube"
+            aria-current={activeTab === "about" ? "page" : undefined}
           >
             <Info size={18} />
             {!sidebarCollapsed && <span>About</span>}
+          </button>
+
+          <button
+            onClick={() => setActiveTab("settings")}
+            className={`p-2 rounded-md transition-all duration-150 text-sm font-medium flex items-center gap-3 ${activeTab === "settings"
+              ? "bg-[#37373D] text-white shadow-sm border-l-2 border-gray-400"
+              : "text-gray-400 hover:bg-[#2D2D30] hover:text-white"
+              }`}
+            title="Settings"
+            aria-label="Open settings"
+            aria-current={activeTab === "settings" ? "page" : undefined}
+          >
+            <SettingsIcon size={18} />
+            {!sidebarCollapsed && <span>Settings</span>}
           </button>
         </nav>
 
@@ -537,29 +888,101 @@ function App() {
               className="flex-1 flex flex-col p-12 overflow-y-auto"
             >
               {/* Header Section */}
-              <div className="mb-12">
-                <h1 className="text-4xl text-white mb-2 font-bold tracking-tight drop-shadow-sm flex items-center gap-3">
-                  <div className="w-1 h-8 bg-neo-mint rounded-full"></div>
-                  INPUT TARGET
-                </h1>
-                <p className="text-gray-400 text-base ml-4">Enter a YouTube URL to extract metadata and formats.</p>
+              <div className="mb-12 flex items-start justify-between">
+                <div>
+                  <h1 className="text-4xl text-white mb-2 font-bold tracking-tight drop-shadow-sm flex items-center gap-3">
+                    <div className="w-1 h-8 bg-neo-mint rounded-full"></div>
+                    SEARCH
+                  </h1>
+                  <p className="text-gray-400 text-base ml-4">Enter a URL or search for videos by title.</p>
+                </div>
+                {/* Platform Selector - top right */}
+                <PlatformSelector
+                  selectedPlatform={selectedPlatform}
+                  onSelect={(platform) => {
+                    setSelectedPlatform(platform);
+                    const platformName = PLATFORMS.find(p => p.id === platform)?.name || "YouTube";
+                    setToastMessage(`Source: ${platformName} (applies to text search only)`);
+                    setShowToast(true);
+                  }}
+                  excludeShorts={excludeShorts}
+                  onExcludeShortsChange={setExcludeShorts}
+                />
               </div>
 
-              {/* Input Section - OPAQUE/SOLID */}
+              {/* Input Section with Search History */}
               <div className="flex gap-4 mb-10">
-                <input
-                  type="text"
-                  value={url}
-                  onChange={(e) => setUrl(e.target.value)}
-                  placeholder="Paste URL here..."
-                  className="flex-1 p-4 rounded-lg input-solid text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-neo-mint shadow-md text-base transition-all"
-                />
+                <div className="flex-1 relative">
+                  <input
+                    type="text"
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                    placeholder="Enter URL or search query..."
+                    className="w-full p-4 pr-10 rounded-lg input-solid text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-neo-mint shadow-md text-base transition-all"
+                    onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                    onFocus={() => !url && searchHistory.length > 0 && setShowSearchHistory(true)}
+                    onBlur={() => setTimeout(() => setShowSearchHistory(false), 200)}
+                  />
+
+                  {/* Clear Button */}
+                  {url && (
+                    <button
+                      onClick={() => {
+                        setUrl("");
+                        setSearchResults([]);
+                        setVideoMetadata(null);
+                        setFormats([]);
+                        setStatusMessage("");
+                      }}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 p-1 rounded-full hover:bg-white/10 text-gray-400 hover:text-white transition-all"
+                      aria-label="Clear search"
+                    >
+                      <X size={18} />
+                    </button>
+                  )}
+
+                  {/* Search History Dropdown */}
+                  <AnimatePresence>
+                    {showSearchHistory && searchHistory.length > 0 && (
+                      <motion.div
+                        initial={{ opacity: 0, y: -10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -10 }}
+                        className="absolute top-full left-0 right-0 mt-2 bg-[#1E1E24] border border-white/10 rounded-lg shadow-xl z-50 overflow-hidden"
+                      >
+                        <div className="flex justify-between items-center px-3 py-2 border-b border-white/5">
+                          <span className="text-xs text-gray-500 font-mono">Recent Searches</span>
+                          <button
+                            onClick={clearSearchHistory}
+                            className="text-xs text-gray-500 hover:text-red-400 transition-colors"
+                          >
+                            Clear All
+                          </button>
+                        </div>
+                        {searchHistory.map((query, index) => (
+                          <button
+                            key={`${query}-${index}`}
+                            onMouseDown={() => {
+                              setUrl(query);
+                              setShowSearchHistory(false);
+                              setTimeout(() => handleSearch(), 100);
+                            }}
+                            className="w-full px-3 py-2 text-left text-sm text-white/80 hover:bg-white/5 hover:text-neo-mint transition-colors flex items-center gap-2"
+                          >
+                            <Clock size={12} className="text-gray-500" />
+                            <span className="truncate">{query}</span>
+                          </button>
+                        ))}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
                 <button
-                  onClick={handleFetchFormats}
-                  disabled={loadingFormats}
+                  onClick={handleSearch}
+                  disabled={loadingFormats || searchLoading}
                   className="px-8 py-4 rounded-lg bg-neo-mint text-black font-bold tracking-wide shadow-md hover:brightness-110 active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  {loadingFormats ? "SCANNING..." : "SCAN"}
+                  {loadingFormats || searchLoading ? "SEARCHING..." : "SEARCH"}
                 </button>
               </div>
 
@@ -583,13 +1006,79 @@ function App() {
                 </div>
               )}
 
-              {/* Video Metadata Card */}
-              {videoMetadata && (
+              {/* Skeleton Loading State */}
+              {searchLoading && (
+                <div className="mb-10">
+                  <h2 className="text-lg text-white font-semibold mb-4 flex items-center gap-2">
+                    <span className="text-neo-mint animate-pulse">●</span> Searching...
+                  </h2>
+                  <SkeletonGrid count={8} />
+                </div>
+              )}
+
+              {/* Search Results Grid */}
+              {!searchLoading && searchResults.length > 0 && (
+                <div className="mb-10">
+                  <h2 className="text-lg text-white font-semibold mb-4 flex items-center gap-2">
+                    <span className="text-neo-mint">▶</span> Search Results
+                  </h2>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                    {searchResults.map((result, index) => (
+                      <SearchResultCard
+                        key={`${result.video_url}-${index}`}
+                        result={result}
+                        onClick={handleSearchResultClick}
+                      />
+                    ))}
+                  </div>
+
+                  {/* Load More Button */}
+                  {hasMoreResults && (
+                    <div className="flex justify-center mt-8">
+                      <button
+                        onClick={handleLoadMore}
+                        disabled={loadingMore}
+                        className="px-8 py-3 rounded-lg bg-[#2D2D30] text-white font-medium hover:bg-[#37373D] transition-all border border-white/10 flex items-center gap-2 disabled:opacity-50"
+                      >
+                        {loadingMore ? (
+                          <>
+                            <span className="animate-spin">⟳</span> Loading...
+                          </>
+                        ) : (
+                          <>
+                            <span>↓</span> Load More Results
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Skeleton Loading State for Video Formats */}
+              {loadingFormats && (
+                <div className="mb-10">
+                  <FormatSkeletonGrid count={10} />
+                </div>
+              )}
+
+              {/* Video Metadata Card (single videos only) */}
+              {!loadingFormats && videoMetadata && !videoMetadata.is_playlist && (
                 <div className="mb-10">
                   <VideoMetadataCard
                     metadata={videoMetadata}
                     formats={formats}
                     onDownload={(id) => handleDownload(id, "best")}
+                  />
+                </div>
+              )}
+
+              {/* Playlist Metadata Card (playlists only) */}
+              {playlistMetadata && (
+                <div className="mb-10">
+                  <PlaylistMetadataCard
+                    metadata={playlistMetadata}
+                    onDownloadSelected={handlePlaylistDownload}
                   />
                 </div>
               )}
@@ -608,16 +1097,9 @@ function App() {
             />
           )}
 
-          {activeTab === "browse" && (
-            <YouTubeBrowser
-              sidebarWidth={sidebarWidth}
-              onVideoDetected={handleVideoDetected}
-            />
-          )}
+          {activeTab === "settings" && <Settings />}
 
-          {activeTab === "about" && (
-            <AboutUs />
-          )}
+          {activeTab === "about" && <AboutUs />}
 
         </AnimatePresence>
         {/* First Run Setup Overlay */}
@@ -659,6 +1141,28 @@ function App() {
         onRestart={handleRestartForUpdate}
         onDismiss={() => setUpdateReady(false)}
       />
+
+      {/* Action Dialog - Play or Download */}
+      {actionDialogVisible && pendingVideo && (
+        <ActionDialog
+          videoUrl={pendingVideo.url}
+          videoTitle={pendingVideo.title}
+          thumbnailUrl={pendingVideo.thumbnail}
+          onPlay={handlePlayChoice}
+          onDownload={handleDownloadChoice}
+          onClose={() => setActionDialogVisible(false)}
+        />
+      )}
+
+      {/* Stream Player */}
+      {streamPlayerVisible && pendingVideo && (
+        <StreamPlayer
+          videoUrl={pendingVideo.url}
+          videoTitle={pendingVideo.title}
+          onClose={() => setStreamPlayerVisible(false)}
+          onDownload={handleStreamToDownload}
+        />
+      )}
     </div >
   );
 }

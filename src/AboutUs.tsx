@@ -5,12 +5,20 @@ import {
     Clock,
 } from "lucide-react";
 import { useEffect, useState } from "react";
+import { getName, getVersion } from "@tauri-apps/api/app";
 
 function AboutUs() {
     const [time, setTime] = useState(new Date());
+    const [appName, setAppName] = useState("Alpha Tube");
+    const [appVersion, setAppVersion] = useState("");
 
     useEffect(() => {
         const timer = setInterval(() => setTime(new Date()), 1000);
+
+        // Fetch App Info
+        getName().then(setAppName).catch(console.error);
+        getVersion().then(v => setAppVersion(`v${v}`)).catch(console.error);
+
         return () => clearInterval(timer);
     }, []);
 
@@ -57,7 +65,7 @@ function AboutUs() {
                     {/* Left: Window Title equivalent */}
                     <div className="text-xs tracking-widest uppercase text-cyan-400 font-bold flex items-center gap-2">
                         <Terminal size={12} />
-                        <span>Alpha Tube v0.1.3</span>
+                        <span>{appName} {appVersion}</span>
                     </div>
 
                     {/* Right: Modules (Only Battery & Time) */}

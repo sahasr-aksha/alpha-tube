@@ -135,3 +135,38 @@ body {
     backdrop-filter: blur(10px);
     border: 1px solid rgba(255, 255, 255, 0.05);
 }
+
+/* Search Result Cards */
+.search-result-card {
+    background-color: #1E1E24;
+    transition: all 0.2s ease-in-out;
+}
+
+.search-result-card:hover {
+    background-color: #252530;
+    box-shadow: 0 0 20px rgba(0, 255, 163, 0.15);
+}
+
+.card-dark {
+    background-color: #1A1A1F;
+}
+
+/* Skeleton Shimmer Animation */
+.shimmer-animation {
+    background: linear-gradient(90deg,
+            transparent 0%,
+            rgba(255, 255, 255, 0.05) 50%,
+            transparent 100%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+}
+
+@keyframes shimmer {
+    0% {
+        background-position: 200% 0;
+    }
+
+    100% {
+        background-position: -200% 0;
+    }
+}
