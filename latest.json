@@ -1,11 +1,11 @@
 {
-  "version": "0.1.5",
-  "notes": "1) A dedicated settings option for better updates\n2) More Robust error handeling\n3) Integrated online streaming\n4) Better search feature now no need for URLs",
-  "pub_date": "2026-01-13T06:20:00Z",
+  "version": "1.0.0",
+  "notes": "1) v1.0.0 Release!\n2) A dedicated settings option for better updates\n3) More Robust error handeling\n4) Integrated online streaming\n5) Better search feature now no need for URLs",
+  "pub_date": "2026-01-13T09:00:00Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUa3lHVndEYVhINWNnREl0bDhXZmxQb2dvTHhLcTd6d2tGS0owZHF3K0dsb3d6Ti9ZVFR3aDhPd3NjcWJtekEzYkd6NWpwNXRjVVlud2tnZzdseURMVWlncHpiR05oS1FBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzY4Mjg1NjA5CWZpbGU6QWxwaGEgVHViZV8wLjEuNV94NjQtc2V0dXAuZXhlCmVhQ1dReXJtcVU3L0NOL084TCtVc1QwMDRvaFcwVTdkZEZ4VUd4cGZCSCt2MVhIMjNydjV5UkswU1JDWDRlNkdSR2xoM2k2QXdKVUtPR1RIbXBWR0F3PT0K",
-      "url": "https://github.com/sahasr-aksha/alpha-tube/releases/download/v0.1.5/Alpha.Tube_0.1.5_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUa3lHVndEYVhINWMyRXRwV1Y5bDZjdUtPS3NXc0pBNzZXSTJsN252TFE3anlBU0hIbGE1djVCbE9MNy9aQUFHSUN2b0FFT1ViUHhjeXhTaEliNVcyT09LVXdjR2N4NWdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzY4Mjk1MjE2CWZpbGU6QWxwaGEgVHViZV8xLjAuMF94NjQtc2V0dXAuZXhlClR4VjhsK1IwWFUwWWppL2FRQWNLODc5VzREaGJLRjZENXRGRkNNNTZ0ZFI5dG50ZnpUS0NCTkRnVm42RERvNEpOWEFIMGpjZW81bElPRjF3OVJ4RkJBPT0K",
+      "url": "https://github.com/sahasr-aksha/alpha-tube/releases/download/v1.0.0/Alpha%20Tube_1.0.0_x64-setup.exe"
     }
   }
 }
